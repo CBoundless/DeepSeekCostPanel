@@ -18,11 +18,12 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller requests
+          python -m pip install -r requirements.txt
 
       - name: Build EXE (PyInstaller)
         run: |
