@@ -2,6 +2,15 @@
 __pycache__/
 *.py[cod]
 
+# Virtualenv
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
 # Logs
 *.log
 

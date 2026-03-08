@@ -1,2 +1,4 @@
 requests>=2.31,<3
+# macOS 系统 Python (LibreSSL) 下 urllib3>=2 会打印 NotOpenSSLWarning，这里做兼容性约束
+urllib3<2
 pyinstaller>=6,<7
