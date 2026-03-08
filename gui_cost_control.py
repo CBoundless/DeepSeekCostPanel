@@ -821,11 +821,30 @@ if __name__ == "__main__":
 
     api_key = _get_api_key()
     if not api_key:
-        raise SystemExit(
-            "未检测到 API Key。请先执行：\n"
-            "export DEEPSEEK_API_KEY=\"你的key\"\n"
-            "然后再运行该脚本。"
+        msg = (
+            "未检测到 API Key（环境变量 DEEPSEEK_API_KEY）。\n\n"
+            "macOS/Linux：\n"
+            "  export DEEPSEEK_API_KEY=\"你的key\"\n\n"
+            "Windows（PowerShell，永久）：\n"
+            "  setx DEEPSEEK_API_KEY \"你的key\"\n\n"
+            "设置后请重新启动程序。"
         )
+
+        # 打包成 Windows EXE（--noconsole）后，控制台不可见，这里尽量弹窗提示。
+        try:
+            from tkinter import messagebox
+
+            tmp = tk.Tk()
+            tmp.withdraw()
+            messagebox.showerror("缺少 API Key", msg)
+            try:
+                tmp.destroy()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        raise SystemExit(msg)
 
     # 启动诊断：帮你确认到底走了什么路径
     try:
