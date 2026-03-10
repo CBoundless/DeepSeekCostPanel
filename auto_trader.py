@@ -262,6 +262,13 @@ class AutoTrader:
             return f"OKX order rejected sCode={s_code} sMsg={first.get('sMsg')}"
         return ""
 
+    @staticmethod
+    def _build_cl_ord_id(action: str, inst_id: str) -> str:
+        safe_action = re.sub(r"[^A-Za-z0-9]", "", str(action).upper())[:1] or "X"
+        safe_inst = re.sub(r"[^A-Za-z0-9]", "", str(inst_id).upper())[:12] or "PAIR"
+        nonce = str(time.time_ns())[-13:]
+        return f"DS{safe_action}{nonce}{safe_inst}"[:32]
+
     def _get_balance_snapshot(self, inst_id: str) -> Optional[Dict[str, Dict[str, Optional[float]]]]:
         if "-" in inst_id:
             base_ccy, quote_ccy = inst_id.split("-", 1)
@@ -452,6 +459,7 @@ class AutoTrader:
                         pos.peak_price = max(float(pos.peak_price), float(px))
 
         buy_candidates: List[Tuple[str, int, dict]] = []
+        frequency_limit_skips: List[str] = []
 
         for inst in self.cfg.inst_ids:
             pos = self._pos.get(inst) or PositionState()
@@ -481,17 +489,20 @@ class AutoTrader:
                     if ok:
                         self._reset_position(pos)
                 else:
-                    self.log(f"[{inst}] skip status={r.get('status')} {reason}{_fmt_meta(r)}")
+                    if str(r.get("source") or "") == "frequency_limit":
+                        frequency_limit_skips.append(inst)
+                    else:
+                        self.log(f"[{inst}] skip status={r.get('status')} {reason}{_fmt_meta(r)}")
 
-                    # 解析失败时，把 raw_analysis 也打出来（截断），方便定位 key/格式问题
-                    raw = r.get("raw_analysis")
-                    if raw:
-                        try:
-                            s = str(raw)
-                            s = (s[:800] + "…(truncated)") if len(s) > 800 else s
-                            self.log(f"[{inst}] raw_analysis={s}")
-                        except Exception:
-                            pass
+                        # 解析失败时，把 raw_analysis 也打出来（截断），方便定位 key/格式问题
+                        raw = r.get("raw_analysis")
+                        if raw:
+                            try:
+                                s = str(raw)
+                                s = (s[:800] + "…(truncated)") if len(s) > 800 else s
+                                self.log(f"[{inst}] raw_analysis={s}")
+                            except Exception:
+                                pass
                 continue
 
             # 先做风控：止损/移动止盈（不依赖 AI）
@@ -526,6 +537,11 @@ class AutoTrader:
                 self._log_position(inst, pos, note=f"{rec} conf={conf}{_fmt_meta(r)}")
             else:
                 self.log(f"[{inst}] {rec} (conf={conf} holding={pos.holding}){_fmt_meta(r)}")
+
+        if frequency_limit_skips:
+            preview = ",".join(frequency_limit_skips[:3])
+            more = "" if len(frequency_limit_skips) <= 3 else f" 等{len(frequency_limit_skips)}个"
+            self.log(f"⏸ 本轮因调用频率限制跳过：{preview}{more}")
 
         if not buy_candidates:
             return
@@ -573,7 +589,7 @@ class AutoTrader:
         before_snapshot = self._get_balance_snapshot(inst_id)
         self.log(f"[{inst_id}] 💰 BUY 前余额：{self._format_balance_snapshot(before_snapshot)}")
 
-        clid = f"ds-{int(time.time())}-{inst_id.replace('-', '')[:10]}"[-32:]
+        clid = self._build_cl_ord_id("B", inst_id)
         self.log(f"[{inst_id}] 🚀 提交 BUY 市价单 quote={quote} clOrdId={clid}")
         payload = self.okx.place_order(
             inst_id=inst_id,
@@ -641,7 +657,7 @@ class AutoTrader:
             self.log(f"[{inst_id}] ⚠️ 未找到可卖数量（base={base_ccy}），跳过平仓 payload={bal}")
             return False, None
 
-        clid = f"ds-{int(time.time())}-{base_ccy}"[-32:]
+        clid = self._build_cl_ord_id("S", inst_id)
         self.log(f"[{inst_id}] 🚀 提交 SELL 市价单 sz={sell_sz} {base_ccy} clOrdId={clid}")
         payload = self.okx.place_order(
             inst_id=inst_id,
