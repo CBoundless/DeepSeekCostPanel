@@ -244,6 +244,8 @@ class AnalyzerConfig:
     temperature: float = 0.5
     daily_budget: Optional[float] = None
     budget_enforcement: str = "warn"  # warn | block
+    batch_parse_fallback_single: bool = True
+    batch_parse_fallback_limit: int = 10
 
 
 class OptimizedDeepSeekAnalyzer:
@@ -298,6 +300,8 @@ class OptimizedDeepSeekAnalyzer:
         temperature: Optional[float] = None,
         daily_budget: Optional[float] = None,
         budget_enforcement: Optional[str] = None,
+        batch_parse_fallback_single: Optional[bool] = None,
+        batch_parse_fallback_limit: Optional[int] = None,
     ) -> AnalyzerConfig:
         """应用配置（运行中动态生效）。"""
         if cache_ttl_minutes is not None:
@@ -334,6 +338,12 @@ class OptimizedDeepSeekAnalyzer:
         if budget_enforcement is not None:
             mode = (budget_enforcement or "").strip().lower()
             self.config.budget_enforcement = mode if mode in ("warn", "block") else "warn"
+
+        if batch_parse_fallback_single is not None:
+            self.config.batch_parse_fallback_single = bool(batch_parse_fallback_single)
+
+        if batch_parse_fallback_limit is not None:
+            self.config.batch_parse_fallback_limit = max(0, int(batch_parse_fallback_limit))
 
         return self.config
 
@@ -779,8 +789,9 @@ class OptimizedDeepSeekAnalyzer:
 
         per_cost = float(cost) / max(1, len(pending))
         per_tokens = int(total_tokens / max(1, len(pending)))
+        fallback_candidates: List[Tuple[str, List[List], Dict]] = []
 
-        for inst, _ohlcv, indicators, _q in pending:
+        for inst, ohlcv, indicators, _q in pending:
             item = parsed.get(inst)
             if not isinstance(item, dict) or not item:
                 out = {
@@ -791,8 +802,9 @@ class OptimizedDeepSeekAnalyzer:
                     "confidence": 0,
                     "target_price": None,
                     "stop_loss": None,
+                    "source": "api_parse_miss",
                 }
-                out["source"] = "api_parse_miss"
+                fallback_candidates.append((inst, ohlcv, indicators))
             else:
                 out = {
                     "status": item.get("status") or "success",
@@ -801,8 +813,8 @@ class OptimizedDeepSeekAnalyzer:
                     "confidence": self._coerce_confidence(item.get("confidence"), default=0),
                     "target_price": item.get("target_price"),
                     "stop_loss": item.get("stop_loss"),
+                    "source": "api",
                 }
-                out["source"] = "api"
 
             out["cost"] = round(per_cost, 6)
             out["tokens"] = int(per_tokens)
@@ -810,10 +822,28 @@ class OptimizedDeepSeekAnalyzer:
             out["market_source"] = "okx"
             out["inst_id"] = inst
 
-            # 仅在成功解析时缓存
             if out.get("status") == "success":
                 self.cache.set(inst, tf_for_cache, indicators, dict(out))
             results[inst] = out
+
+        fallback_limit = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
+        fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and fallback_limit > 0
+        fallback_used = 0
+
+        if fallback_enabled:
+            for inst, ohlcv, indicators in fallback_candidates[:fallback_limit]:
+                single = self._analyze_single_with_existing_data(inst, tf_for_cache, ohlcv, indicators, cache_result=True)
+                single["source"] = f"{single.get('source') or 'api'}_fallback_single"
+                single["fallback_reason"] = "batch_parse_miss"
+                single["market_source"] = "okx"
+                single["inst_id"] = inst
+                results[inst] = single
+                fallback_used += 1
+
+        if len(fallback_candidates) > fallback_used:
+            for inst, _ohlcv, _ind in fallback_candidates[fallback_used:]:
+                results[inst]["message"] = f"{results[inst].get('message') or 'API 返回未匹配到该标的'}；单币兜底已达到上限 {fallback_limit}"
+                results[inst]["fallback_reason"] = "batch_parse_miss"
 
         return {
             "status": "success",
@@ -824,6 +854,10 @@ class OptimizedDeepSeekAnalyzer:
                 "okx_bar": okx_bar,
                 "tokens": int(total_tokens),
                 "cost": round(float(cost), 6),
+                "parsed_count": len(parsed),
+                "parse_miss_count": len(fallback_candidates),
+                "single_fallback_used": int(fallback_used),
+                "single_fallback_limit": int(fallback_limit),
             },
             "budget": self._get_budget_state(),
         }
@@ -963,8 +997,9 @@ class OptimizedDeepSeekAnalyzer:
 
         per_cost = float(cost) / max(1, len(pending))
         per_tokens = int(total_tokens / max(1, len(pending)))
+        fallback_candidates: List[Tuple[str, List[List], Dict]] = []
 
-        for sym, _ohlcv, indicators, _q in pending:
+        for sym, ohlcv, indicators, _q in pending:
             item = parsed.get(sym)
             if not isinstance(item, dict) or not item:
                 out = {
@@ -975,10 +1010,10 @@ class OptimizedDeepSeekAnalyzer:
                     "confidence": 0,
                     "target_price": None,
                     "stop_loss": None,
+                    "source": "api_parse_miss",
                 }
-                out["source"] = "api_parse_miss"
+                fallback_candidates.append((sym, ohlcv, indicators))
             else:
-                # 统一字段（尽量兼容单次分析的输出结构）
                 out = {
                     "status": item.get("status") or "success",
                     "raw_analysis": item.get("raw_analysis") or content,
@@ -986,17 +1021,33 @@ class OptimizedDeepSeekAnalyzer:
                     "confidence": self._coerce_confidence(item.get("confidence"), default=0),
                     "target_price": item.get("target_price"),
                     "stop_loss": item.get("stop_loss"),
+                    "source": "api",
                 }
-                out["source"] = "api"
 
             out["cost"] = round(per_cost, 6)
             out["tokens"] = int(per_tokens)
             out["budget"] = self._get_budget_state()
 
-            # 仅在成功解析时缓存
             if out.get("status") == "success":
                 self.cache.set(sym, tf, indicators, dict(out))
             results[sym] = out
+
+        fallback_limit = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
+        fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and fallback_limit > 0
+        fallback_used = 0
+
+        if fallback_enabled:
+            for sym, ohlcv, indicators in fallback_candidates[:fallback_limit]:
+                single = self._analyze_single_with_existing_data(sym, tf, ohlcv, indicators, cache_result=True)
+                single["source"] = f"{single.get('source') or 'api'}_fallback_single"
+                single["fallback_reason"] = "batch_parse_miss"
+                results[sym] = single
+                fallback_used += 1
+
+        if len(fallback_candidates) > fallback_used:
+            for sym, _ohlcv, _ind in fallback_candidates[fallback_used:]:
+                results[sym]["message"] = f"{results[sym].get('message') or 'API 返回未匹配到该交易对'}；单币兜底已达到上限 {fallback_limit}"
+                results[sym]["fallback_reason"] = "batch_parse_miss"
 
         return {
             "status": "success",
@@ -1006,17 +1057,24 @@ class OptimizedDeepSeekAnalyzer:
                 "symbols": [x[0] for x in pending],
                 "tokens": int(total_tokens),
                 "cost": round(float(cost), 6),
+                "parsed_count": len(parsed),
+                "parse_miss_count": len(fallback_candidates),
+                "single_fallback_used": int(fallback_used),
+                "single_fallback_limit": int(fallback_limit),
             },
             "budget": self._get_budget_state(),
         }
 
     def _build_batch_prompt(self, timeframe: str, items: List[Tuple[str, List[List], Dict, float]]) -> str:
+        example_key = str(items[0][0]) if items else "BTC-USDT"
         lines = [
             "你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。",
             "JSON 格式如下：",
-            '{"BTCUSDT": {"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "target_price": number|null, "stop_loss": number|null, "reason": string}}',
+            f'{{"{example_key}": {{"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "target_price": number|null, "stop_loss": number|null, "reason": string}}}}',
             "",
             "强约束：confidence 必须是 0-100 的整数，不能把 50 当默认值（除非你判断确实完全中性）。",
+            "必须覆盖 data 中列出的每一个标的，不能遗漏，也不能把多个标的合并成一个 key。",
+            "输出 key 必须与 data 行首冒号前的标识完全一致（例如输入是 BTC-USDT，就输出 BTC-USDT；不要改成 BTCUSDT）。",
             "",
             f"timeframe: {timeframe}",
             "data:",
@@ -1029,45 +1087,222 @@ class OptimizedDeepSeekAnalyzer:
         lines.append("\n只输出 JSON。")
         return "\n".join(lines)
 
-    def _parse_batch_response(self, response_text: str, symbols: List[str]) -> Dict[str, Dict]:
-        """尽量把批量响应解析成 {symbol -> dict}。
+    def _extract_json_candidates(self, text: str) -> List[Any]:
+        candidates: List[str] = []
+        seen_segments = set()
 
-        关键点：模型可能返回 `BTCUSDT` 或 `BTC-USDT`，这里用 `_normalize_symbol()`
-        做“等价 key”匹配，并最终**映射回请求时的原始 symbol/instId**，避免上层 `parsed.get(inst)` 拿不到。
-        """
+        def _push(segment: str) -> None:
+            seg = (segment or "").strip()
+            if not seg or seg in seen_segments:
+                return
+            seen_segments.add(seg)
+            candidates.append(seg)
+
+        _push(text)
+        for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+            _push(block)
+
+        start_obj = text.find("{")
+        end_obj = text.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            _push(text[start_obj : end_obj + 1])
+
+        start_arr = text.find("[")
+        end_arr = text.rfind("]")
+        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+            _push(text[start_arr : end_arr + 1])
+
+        parsed: List[Any] = []
+        seen_payloads = set()
+        decoder = json.JSONDecoder()
+
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+                key = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+                if key not in seen_payloads:
+                    seen_payloads.add(key)
+                    parsed.append(obj)
+            except Exception:
+                pass
+
+            for idx, ch in enumerate(candidate):
+                if ch not in "[{":
+                    continue
+                try:
+                    obj, _end = decoder.raw_decode(candidate[idx:])
+                except Exception:
+                    continue
+                try:
+                    key = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+                except Exception:
+                    continue
+                if key not in seen_payloads:
+                    seen_payloads.add(key)
+                    parsed.append(obj)
+
+        return parsed
+
+    @staticmethod
+    def _looks_like_analysis_payload(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        keys = {str(k).lower() for k in item.keys()}
+        return bool(keys & {"recommendation", "action", "confidence", "target_price", "stop_loss", "reason", "status"})
+
+    @staticmethod
+    def _extract_symbol_hint(item: Dict[str, Any]) -> Optional[str]:
+        for key in ("symbol", "sym", "inst_id", "instId", "pair", "market", "ticker", "code", "asset"):
+            value = item.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    def _collect_batch_items(
+        self,
+        payload: Any,
+        allow_map: Dict[str, str],
+        requested_symbols: List[str],
+        out: Dict[str, Dict],
+        *,
+        depth: int = 0,
+    ) -> None:
+        if depth > 5 or payload is None:
+            return
+
+        if isinstance(payload, dict):
+            hint = self._extract_symbol_hint(payload)
+            if hint and self._looks_like_analysis_payload(payload):
+                norm_hint = self._normalize_symbol(hint)
+                mapped = allow_map.get(norm_hint)
+                if mapped and mapped not in out:
+                    item = dict(payload)
+                    for key in ("symbol", "sym", "inst_id", "instId", "pair", "market", "ticker", "code", "asset"):
+                        item.pop(key, None)
+                    out[mapped] = item
+
+            for key, value in payload.items():
+                norm_key = self._normalize_symbol(str(key))
+                mapped = allow_map.get(norm_key)
+                if mapped and isinstance(value, dict):
+                    out[mapped] = dict(value)
+
+            for container_key in ("results", "result", "data", "items", "analyses", "analysis", "markets", "symbols", "assets"):
+                if container_key in payload:
+                    self._collect_batch_items(payload.get(container_key), allow_map, requested_symbols, out, depth=depth + 1)
+
+            for value in payload.values():
+                if isinstance(value, (dict, list)):
+                    self._collect_batch_items(value, allow_map, requested_symbols, out, depth=depth + 1)
+            return
+
+        if isinstance(payload, list):
+            symbolized_count = 0
+            for item in payload:
+                if isinstance(item, dict):
+                    hint = self._extract_symbol_hint(item)
+                    if hint and self._looks_like_analysis_payload(item):
+                        norm_hint = self._normalize_symbol(hint)
+                        mapped = allow_map.get(norm_hint)
+                        if mapped:
+                            symbolized_count += 1
+                            clean_item = dict(item)
+                            for key in ("symbol", "sym", "inst_id", "instId", "pair", "market", "ticker", "code", "asset"):
+                                clean_item.pop(key, None)
+                            out[mapped] = clean_item
+
+            if symbolized_count == 0 and len(payload) == len(requested_symbols):
+                for sym, item in zip(requested_symbols, payload):
+                    if isinstance(item, dict) and self._looks_like_analysis_payload(item) and sym not in out:
+                        out[sym] = dict(item)
+
+            for item in payload:
+                if isinstance(item, (dict, list)):
+                    self._collect_batch_items(item, allow_map, requested_symbols, out, depth=depth + 1)
+
+    def _parse_batch_response(self, response_text: str, symbols: List[str]) -> Dict[str, Dict]:
+        """尽量把批量响应解析成 {symbol -> dict}。"""
         text = (response_text or "").strip()
         if not text:
             return {}
 
-        # 将请求 symbols 做一份“归一化 -> 原样”的白名单映射
         allow_map: Dict[str, str] = {}
+        requested_symbols: List[str] = []
         for x in (symbols or []):
-            nx = self._normalize_symbol(str(x))
+            raw = str(x)
+            nx = self._normalize_symbol(raw)
             if nx and nx not in allow_map:
-                allow_map[nx] = str(x)
+                allow_map[nx] = raw
+                requested_symbols.append(raw)
 
         if not allow_map:
             return {}
 
-        # 1) 优先尝试从全文中截取 JSON 对象
-        try:
-            s = text
-            start = s.find("{")
-            end = s.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                obj = json.loads(s[start : end + 1])
-                if isinstance(obj, dict):
-                    out: Dict[str, Dict] = {}
-                    for k, v in obj.items():
-                        nk = self._normalize_symbol(str(k))
-                        if nk in allow_map and isinstance(v, dict):
-                            out[allow_map[nk]] = v
-                    return out
-        except Exception:
-            pass
+        out: Dict[str, Dict] = {}
+        for payload in self._extract_json_candidates(text):
+            self._collect_batch_items(payload, allow_map, requested_symbols, out)
+            if len(out) >= len(requested_symbols):
+                break
+        return out
 
-        # 2) 解析失败就返回空，让上层走保守兜底
-        return {}
+    def _analyze_single_with_existing_data(
+        self,
+        symbol: str,
+        timeframe: str,
+        ohlcv_data: List[List],
+        indicators: Dict,
+        *,
+        cache_result: bool = True,
+    ) -> Dict:
+        budget_state = self._get_budget_state()
+        try:
+            prompt = self._build_optimized_prompt(symbol, timeframe, ohlcv_data, indicators)
+            response, usage = self._call_deepseek_api_ex(prompt, max_tokens=int(self.config.max_output_tokens))
+            if not response:
+                return {
+                    "status": "error",
+                    "message": "API 调用失败",
+                    "recommendation": "HOLD",
+                    "confidence": 0,
+                    "source": "api_error",
+                    "budget": budget_state,
+                }
+
+            analysis = self._parse_analysis_response(response)
+            prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
+            completion_tokens = int((usage or {}).get("completion_tokens") or 0)
+            total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
+
+            if total_tokens <= 0:
+                total_tokens = self._estimate_tokens(prompt, response)
+
+            if (prompt_tokens or completion_tokens) and callable(getattr(self, "_calculate_cost_from_usage", None)):
+                cost = self._calculate_cost_from_usage(prompt_tokens, completion_tokens)
+            else:
+                cost = self._calculate_cost(total_tokens)
+
+            self.cost_tracker.record_call(total_tokens, cost)
+
+            analysis["cost"] = round(float(cost), 6)
+            analysis["tokens"] = int(total_tokens)
+            analysis["source"] = "api"
+            analysis["budget"] = budget_state
+
+            if cache_result and analysis.get("status") == "success":
+                self.cache.set(symbol, timeframe, indicators, dict(analysis))
+
+            return analysis
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": str(e),
+                "recommendation": "HOLD",
+                "confidence": 0,
+                "source": "exception",
+                "budget": budget_state,
+            }
 
     def analyze_market(self, symbol: str, timeframe: str, ohlcv_data: List[List],
                       indicators: Dict, force_analysis: bool = False) -> Dict:
@@ -1125,48 +1360,8 @@ class OptimizedDeepSeekAnalyzer:
                     "source": "budget_exceeded",
                 }
 
-            # 4. 构建优化的提示词（减少 token 使用）
-            prompt = self._build_optimized_prompt(symbol, timeframe, ohlcv_data, indicators)
-
-            # 5. 调用 API（尽量使用 usage 做精确计价）
-            response, usage = self._call_deepseek_api_ex(prompt, max_tokens=int(self.config.max_output_tokens))
-
-            if response:
-                analysis = self._parse_analysis_response(response)
-
-                prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
-                completion_tokens = int((usage or {}).get("completion_tokens") or 0)
-                total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
-
-                if total_tokens <= 0:
-                    total_tokens = self._estimate_tokens(prompt, response)
-
-                if (prompt_tokens or completion_tokens) and callable(getattr(self, "_calculate_cost_from_usage", None)):
-                    cost = self._calculate_cost_from_usage(prompt_tokens, completion_tokens)
-                else:
-                    cost = self._calculate_cost(total_tokens)
-
-                self.cost_tracker.record_call(total_tokens, cost)
-
-                # 缓存结果
-                self.cache.set(symbol, timeframe, indicators, analysis)
-
-                analysis["cost"] = round(float(cost), 6)
-                analysis["tokens"] = int(total_tokens)
-                analysis["source"] = "api"
-
-                # 附带预算状态（用于 GUI 告警展示）
-                analysis["budget"] = budget_state
-
-                return analysis
-            else:
-                return {
-                    "status": "error",
-                    "message": "API 调用失败",
-                    "recommendation": "HOLD",
-                    "confidence": 0,
-                    "source": "api_error"
-                }
+            # 4. 调用 API 执行单次分析
+            return self._analyze_single_with_existing_data(symbol, timeframe, ohlcv_data, indicators, cache_result=True)
                 
         except Exception as e:
             return {

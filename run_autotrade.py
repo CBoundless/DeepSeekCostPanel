@@ -159,6 +159,8 @@ def _build_analyzer() -> OptimizedDeepSeekAnalyzer:
         temperature=max(0.0, min(1.5, _env_float("ANALYZER_TEMPERATURE", 0.5))),
         daily_budget=_env_optional_float("ANALYZER_DAILY_BUDGET"),
         budget_enforcement=budget_enforcement,
+        batch_parse_fallback_single=_env_bool("ANALYZER_BATCH_PARSE_FALLBACK_SINGLE", True),
+        batch_parse_fallback_limit=max(0, _env_int("ANALYZER_BATCH_PARSE_FALLBACK_LIMIT", 10)),
     )
 
     base_url = _env_str("DEEPSEEK_BASE_URL", default="https://api.deepseek.com/v1") or "https://api.deepseek.com/v1"
@@ -182,7 +184,7 @@ def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnal
         okx.simulated_trading,
     )
     logger.info(
-        "分析参数：base_url=%s cache_ttl=%s min_signal_quality=%s min_interval=%s max_output_tokens=%s temperature=%s daily_budget=%s budget_enforcement=%s",
+        "分析参数：base_url=%s cache_ttl=%s min_signal_quality=%s min_interval=%s max_output_tokens=%s temperature=%s daily_budget=%s budget_enforcement=%s batch_fallback_single=%s batch_fallback_limit=%s",
         analyzer.base_url,
         analyzer.config.cache_ttl_minutes,
         analyzer.config.min_signal_quality,
@@ -191,6 +193,8 @@ def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnal
         analyzer.config.temperature,
         budget if budget is not None else "未设置",
         analyzer.config.budget_enforcement,
+        analyzer.config.batch_parse_fallback_single,
+        analyzer.config.batch_parse_fallback_limit,
     )
 
 

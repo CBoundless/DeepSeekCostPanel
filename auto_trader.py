@@ -304,7 +304,13 @@ class AutoTrader:
                 tks = binfo.get("tokens")
                 cst = binfo.get("cost")
                 rem = budget.get("remaining")
-                self.log(f"📊 本轮批量分析 source={bsrc} tokens={tks} cost=${cst} budget_remaining={rem}")
+                parsed_count = binfo.get("parsed_count")
+                parse_miss_count = binfo.get("parse_miss_count")
+                fallback_used = binfo.get("single_fallback_used")
+                self.log(
+                    f"📊 本轮批量分析 source={bsrc} tokens={tks} cost=${cst} budget_remaining={rem} "
+                    f"parsed={parsed_count} parse_miss={parse_miss_count} fallback_single={fallback_used}"
+                )
         except Exception:
             pass
 
