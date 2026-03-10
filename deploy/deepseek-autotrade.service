@@ -1,0 +1,22 @@
+[Unit]
+Description=DeepSeek OKX AutoTrader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=__ENV_FILE__
+ExecStart=__PROJECT_DIR__/.venv/bin/python __PROJECT_DIR__/run_autotrade.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=45
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

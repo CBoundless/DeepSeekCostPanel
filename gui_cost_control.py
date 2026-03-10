@@ -21,6 +21,19 @@ import sys
 import tkinter as tk
 from tkinter import simpledialog, ttk
 
+import requests
+import socket
+from urllib.parse import urlsplit, urlunsplit
+
+from okx_rest_client import OKXAuth, OKXClient
+from auto_trader import (
+    AutoTrader,
+    TradeConfig,
+    default_okx_symbols_env_value,
+    load_trade_config_from_env,
+    parse_inst_ids,
+)
+
 
 def _get_api_key() -> str | None:
     return os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("deep_api_key") or os.environ.get("DEEP_API_KEY")
@@ -65,14 +78,300 @@ def _should_use_fallback_ui() -> bool:
     return False
 
 
+def _applescript_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sanitize_url_credentials(url: str) -> str:
+    """隐藏 URL 中可能包含的 user:pass@ 信息（避免在 UI/日志里泄露）。"""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        p = urlsplit(raw)
+        if not p.netloc or ("@" not in p.netloc):
+            return raw
+        # netloc: user:pass@host:port
+        host_part = p.netloc.split("@", 1)[-1]
+        safe_netloc = f"***:***@{host_part}"
+        return urlunsplit((p.scheme, safe_netloc, p.path, p.query, p.fragment))
+    except Exception:
+        return raw
+
+
+def _set_env_or_delete(key: str, value: str | None):
+    v = (value or "").strip() if value is not None else ""
+    if v:
+        os.environ[key] = v
+    else:
+        try:
+            os.environ.pop(key, None)
+        except Exception:
+            pass
+
+
+def _prompt_trade_settings(*, parent: tk.Misc | None = None, default_inst_ids: list[str] | None = None, default_bar: str | None = None) -> str:
+    """交互式设置自动交易参数（仅写入本次进程环境变量）。
+
+    - instIds 支持 `btc`/`eth` 这种简写，会自动映射成 `BTC-USDT`。
+    - bar 支持 `1h/1H/15m/1D` 等。
+    """
+
+    def _ask(title: str, prompt: str, default: str = "") -> str | None:
+        # macOS：优先系统弹窗（更稳定可见）
+        if sys.platform == "darwin":
+            try:
+                import subprocess
+
+                d = _applescript_escape(default)
+                p = _applescript_escape(prompt)
+                script = f'text returned of (display dialog "{p}" default answer "{d}" buttons {{"取消","确定"}} default button "确定")'
+                r = subprocess.run(["osascript", "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if r.returncode != 0:
+                    return None
+                return (r.stdout or "").strip()
+            except Exception:
+                pass
+
+        try:
+            return simpledialog.askstring(title, prompt, parent=parent, initialvalue=default)
+        except Exception:
+            return None
+
+    inst_default = ",".join(default_inst_ids or []) if default_inst_ids else (os.environ.get("OKX_SYMBOLS") or default_okx_symbols_env_value())
+    bar_default = (default_bar or os.environ.get("OKX_BAR") or "1H").strip()
+
+    inst_raw = _ask("交易设置", "请输入交易标的（支持 btc/eth 或 BTC-USDT；逗号/空格分隔）：", default=inst_default)
+    if inst_raw is None:
+        return "已取消交易设置"
+
+    inst_ids = parse_inst_ids(inst_raw)
+    if not inst_ids:
+        return "❌ 交易设置失败：未解析到任何标的"
+
+    bar = _ask("交易设置", "请输入 bar/周期（例如 1H/15m/1D；也可填 1h/1d）：", default=bar_default)
+    if bar is None:
+        return "已取消交易设置"
+
+    bar = (bar or "").strip()
+    if not bar:
+        return "❌ 交易设置失败：bar 不能为空"
+
+    # 写入本进程环境变量（AutoTrader 启动时会读取）
+    os.environ["OKX_SYMBOLS"] = ",".join(inst_ids)
+    os.environ["OKX_BAR"] = bar
+
+    return f"✅ 已更新自动交易设置：instIds={inst_ids} bar={bar}（仅本次运行有效）"
+
+
+def _current_network_env_summary() -> str:
+    keys = [
+        "OKX_HTTPS_PROXY",
+        "OKX_HTTP_PROXY",
+        "OKX_ALL_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "OKX_CA_BUNDLE",
+    ]
+    parts = []
+    for k in keys:
+        v = (os.environ.get(k) or "").strip()
+        if not v:
+            continue
+        if "PROXY" in k:
+            v = _sanitize_url_credentials(v)
+        parts.append(f"{k}={v}")
+    return "\n".join(parts) if parts else "(未设置任何代理/证书相关环境变量)"
+
+
+def _prompt_network_settings(parent: tk.Misc | None = None) -> str:
+    """在 GUI 进程内设置代理/证书相关环境变量（不落盘，仅本次进程有效）。"""
+
+    def _ask(title: str, prompt: str, default: str = "") -> str | None:
+        if sys.platform == "darwin":
+            try:
+                import subprocess
+
+                d = _applescript_escape(default)
+                p = _applescript_escape(prompt)
+                script = f'text returned of (display dialog "{p}" default answer "{d}" buttons {{"取消","确定"}} default button "确定")'
+                r = subprocess.run(["osascript", "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if r.returncode != 0:
+                    return None
+                return (r.stdout or "").strip()
+            except Exception:
+                pass
+
+        try:
+            return simpledialog.askstring(title, prompt, parent=parent, initialvalue=default)
+        except Exception:
+            return None
+
+    old = _current_network_env_summary()
+
+    https_p = _ask("网络设置", "请输入 HTTPS_PROXY（留空表示清除）：", default=os.environ.get("HTTPS_PROXY") or "")
+    if https_p is None:
+        return "已取消网络设置"
+
+    http_p = _ask("网络设置", "请输入 HTTP_PROXY（留空表示清除）：", default=os.environ.get("HTTP_PROXY") or "")
+    if http_p is None:
+        return "已取消网络设置"
+
+    ca = _ask(
+        "网络设置",
+        "如公司网关替换 HTTPS 证书：请输入 CA bundle 路径（REQUESTS_CA_BUNDLE；留空表示清除）：",
+        default=os.environ.get("REQUESTS_CA_BUNDLE") or "",
+    )
+    if ca is None:
+        return "已取消网络设置"
+
+    no_proxy = _ask("网络设置", "可选：请输入 NO_PROXY（逗号分隔；留空表示清除）：", default=os.environ.get("NO_PROXY") or "")
+    if no_proxy is None:
+        return "已取消网络设置"
+
+    _set_env_or_delete("HTTPS_PROXY", https_p)
+    _set_env_or_delete("HTTP_PROXY", http_p)
+    _set_env_or_delete("REQUESTS_CA_BUNDLE", ca)
+    _set_env_or_delete("NO_PROXY", no_proxy)
+
+    new = _current_network_env_summary()
+
+    return (
+        "✅ 已更新本进程网络设置（仅本次运行有效）\n\n"
+        "--- 变更前 ---\n"
+        f"{old}\n\n"
+        "--- 变更后 ---\n"
+        f"{new}\n\n"
+        "提示：如果你是从 Finder/IDE 启动 GUI，通常不会加载 shell 的代理环境变量；\n"
+        "用这里设置能直接让 requests 生效。"
+    )
+
+
+def _okx_network_diagnose() -> str:
+    """对 OKX 做一组快速网络自检：DNS + HTTPS 请求（带超时）。"""
+    bases = ["https://www.okx.com", "https://okx.com", "https://www.okex.com"]
+    lines: list[str] = []
+
+    lines.append("🌐 OKX 网络自检")
+    lines.append("")
+    lines.append("当前代理/证书环境变量：")
+    lines.append(_current_network_env_summary())
+    lines.append("")
+
+    # DNS
+    lines.append("DNS 解析：")
+    for host in ["www.okx.com", "okx.com", "www.okex.com"]:
+        try:
+            infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+            ips = []
+            for it in infos:
+                ip = (it[4] or ("", 0))[0]
+                if ip and ip not in ips:
+                    ips.append(ip)
+            lines.append(f"- {host}: {', '.join(ips[:6]) if ips else '(no ip)'}")
+        except Exception as e:
+            lines.append(f"- {host}: ❌ {type(e).__name__}: {e}")
+
+    # HTTPS
+    lines.append("")
+    lines.append("HTTPS 请求：")
+    for base in bases:
+        try:
+            url = f"{base}/api/v5/market/ticker"
+            r = requests.get(url, params={"instId": "BTC-USDT"}, timeout=8, headers={"User-Agent": "DeepSeekCostPanel/1.0"})
+            ok = (r.status_code == 200)
+            sample = (r.text or "")[:200].replace("\n", " ")
+            lines.append(f"- {base}: HTTP {r.status_code} ok={ok} body={sample}")
+        except Exception as e:
+            lines.append(f"- {base}: ❌ {type(e).__name__}: {e}")
+
+    lines.append("")
+    lines.append("结论提示：")
+    lines.append("- 如果 DNS 正常但 HTTPS 报 SSLError/EOF，通常是公司代理/安全网关拦截或策略阻断导致 TLS 失败。")
+    lines.append("- 可以尝试手机热点/VPN/代理，或配置 HTTPS_PROXY 与公司 CA（REQUESTS_CA_BUNDLE）。")
+
+    return "\n".join(lines)
+
+
+def _get_okx_client_interactive(parent: tk.Misc | None = None) -> OKXClient:
+    """优先从环境变量读取 OKX 凭证；如果读取不到，则弹窗让用户输入。
+
+    解释：macOS 上从 Finder/IDE 启动的 GUI 进程，通常不会加载 `~/.zshrc`，
+    所以即使你在 zshrc 里 export 了，GUI 里也可能读不到。
+    """
+
+    # 1) 先尝试环境变量
+    okx = OKXClient()
+    try:
+        okx.require_auth()
+        return okx
+    except Exception:
+        pass
+
+    # 2) 交互式输入（不落盘，仅本次进程有效）
+    def _ask(title: str, prompt: str, secret: bool = False) -> str | None:
+        if sys.platform == "darwin":
+            try:
+                import subprocess
+
+                hidden = " with hidden answer" if secret else ""
+                script = f'text returned of (display dialog "{prompt}" default answer ""{hidden} buttons {{"取消","确定"}} default button "确定")'
+                p = subprocess.run(["osascript", "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if p.returncode != 0:
+                    return None
+                return (p.stdout or "").strip()
+            except Exception:
+                # fallthrough to Tk
+                pass
+
+        try:
+            return simpledialog.askstring(title, prompt, parent=parent, show="*" if secret else None)
+        except Exception:
+            return None
+
+    api_key = (_ask("OKX 凭证", "请输入 OKX_API_KEY：", secret=False) or "").strip()
+    api_secret = (_ask("OKX 凭证", "请输入 OKX_API_SECRET：", secret=True) or "").strip()
+    passphrase = (_ask("OKX 凭证", "请输入 OKX_PASSPHRASE：", secret=True) or "").strip()
+
+    if not (api_key and api_secret and passphrase):
+        raise RuntimeError("缺少 OKX 凭证：请设置环境变量 OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE（或在弹窗中输入）")
+
+    okx2 = OKXClient(auth=OKXAuth(api_key, api_secret, passphrase))
+    okx2.require_auth()
+    return okx2
+
+
 class CostControlPanel:
     """最开始的原版样式（ttk 布局）"""
 
     def __init__(self, parent_frame, analyzer):
         self.analyzer = analyzer
+        self._trader: AutoTrader | None = None
+        self._trade_logs: list[str] = []
         self.frame = ttk.Frame(parent_frame)
         self.frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self._create_widgets()
+
+    def prompt_trade_settings(self):
+        """在 ttk UI 下配置自动交易标的/周期（写入本进程 env）。"""
+        try:
+            cfg = load_trade_config_from_env()
+            msg = _prompt_trade_settings(parent=self.frame.winfo_toplevel(), default_inst_ids=cfg.inst_ids, default_bar=cfg.bar)
+            try:
+                self.stats_status.config(text=msg)
+            except Exception:
+                pass
+            self._trade_log(msg)
+        except Exception as e:
+            try:
+                self.stats_status.config(text=f"交易设置失败：{e}")
+            except Exception:
+                pass
+            self._trade_log(f"❌ 交易设置失败：{e}")
 
     def _create_widgets(self):
         # 标题
@@ -122,6 +421,9 @@ class CostControlPanel:
 
         ttk.Button(budget_input_frame, text="计算优化配置", command=self._calculate_optimization).pack(side=tk.LEFT)
         ttk.Button(budget_input_frame, text="📈 市场分析", command=self.run_market_analysis).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(budget_input_frame, text="⚙️ 交易设置", command=self.prompt_trade_settings).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(budget_input_frame, text="▶️ 启动自动交易(模拟盘)", command=self.start_autotrade).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(budget_input_frame, text="⏹ 停止自动交易", command=self.stop_autotrade).pack(side=tk.LEFT, padx=(8, 0))
 
         self.config_text = tk.Text(config_frame, height=8, width=60, bg="#f0f0f0", wrap=tk.WORD)
         self.config_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -144,14 +446,35 @@ class CostControlPanel:
             if not timeframe:
                 return
 
-            result = self.analyzer.analyze_market_from_binance(symbol=symbol, timeframe=timeframe, limit=200, force_analysis=True)
-            txt = (
-                f"📈 市场分析结果（{symbol.upper()} {timeframe} / source={result.get('source')}）\n\n"
-                f"recommendation: {result.get('recommendation')}\n"
-                f"confidence: {result.get('confidence')}\n"
-                f"status: {result.get('status')}\n\n"
-                f"raw_analysis:\n{result.get('raw_analysis') or ''}"
-            )
+            import re
+
+            symbols = [s.strip().upper().replace("/", "") for s in re.split(r"[,\s]+", symbol or "") if s.strip()]
+
+            if len(symbols) > 1:
+                batch = self.analyzer.analyze_markets_from_binance(symbols=symbols, timeframe=timeframe, limit=200, force_analysis=True)
+                results = batch.get("results") or {}
+
+                lines = [f"📈 批量市场分析（{timeframe} / source={batch.get('source')}）"]
+                for sym in symbols:
+                    r = results.get(sym) or {}
+                    reason = r.get("reason") or r.get("message") or ""
+                    lines.append(
+                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} confidence={r.get('confidence')} {reason}".strip()
+                    )
+                    if r.get("raw_analysis"):
+                        lines.append(str(r.get("raw_analysis")))
+
+                txt = "\n".join(lines)
+            else:
+                one = symbols[0] if symbols else (symbol or "")
+                result = self.analyzer.analyze_market_from_binance(symbol=one, timeframe=timeframe, limit=200, force_analysis=True)
+                txt = (
+                    f"📈 市场分析结果（{one.upper()} {timeframe} / source={result.get('source')}）\n\n"
+                    f"recommendation: {result.get('recommendation')}\n"
+                    f"confidence: {result.get('confidence')}\n"
+                    f"status: {result.get('status')}\n\n"
+                    f"raw_analysis:\n{result.get('raw_analysis') or ''}"
+                )
 
             self.config_text.config(state=tk.NORMAL)
             self.config_text.delete(1.0, tk.END)
@@ -187,6 +510,20 @@ class CostControlPanel:
         self.avg_cost_label.config(text=f"${summary['avg_cost_per_call']:.6f}")
         self.total_tokens_label.config(text=str(summary["total_tokens"]))
 
+        # 预算告警提示（如设置了 daily_budget）
+        try:
+            if summary.get("daily_budget"):
+                if summary.get("budget_exceeded"):
+                    self.stats_status.config(
+                        text=f"⚠️ 今日成本 ${summary['today_cost']:.4f} 已超预算 ${float(summary['daily_budget']):.2f}（{summary.get('budget_enforcement')}）"
+                    )
+                else:
+                    rem = summary.get("budget_remaining")
+                    if rem is not None:
+                        self.stats_status.config(text=f"预算剩余：${float(rem):.4f}")
+        except Exception:
+            pass
+
     def _calculate_optimization(self):
         try:
             budget = float(self.budget_entry.get())
@@ -197,9 +534,9 @@ class CostControlPanel:
             self.config_text.config(state=tk.DISABLED)
             return
 
-        from deepseek_analyzer_optimized import CostOptimizationStrategy
-
-        config = CostOptimizationStrategy.get_recommended_config(budget)
+        # 让预算配置真实作用到分析器（缓存 TTL / 阈值 / 频率限制 / 预算告警）
+        enforcement = (os.environ.get("BUDGET_ENFORCEMENT") or "warn").strip().lower()
+        config = self.analyzer.apply_budget(budget, enforcement=enforcement)
 
         self.config_text.config(state=tk.NORMAL)
         self.config_text.delete(1.0, tk.END)
@@ -228,6 +565,146 @@ class CostControlPanel:
         self.config_text.insert(tk.END, config_text)
         self.config_text.config(state=tk.DISABLED)
 
+    def _trade_log(self, msg: str):
+        try:
+            from datetime import datetime
+
+            ts = datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            ts = ""
+        line = f"[{ts}] {msg}" if ts else str(msg)
+        self._trade_logs.append(line)
+        if len(self._trade_logs) > 200:
+            self._trade_logs = self._trade_logs[-200:]
+
+        try:
+            self.config_text.config(state=tk.NORMAL)
+            self.config_text.delete(1.0, tk.END)
+            self.config_text.insert(tk.END, "\n".join(self._trade_logs))
+            self.config_text.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def prompt_network_settings(self):
+        try:
+            txt = _prompt_network_settings(parent=self.frame.winfo_toplevel())
+            self.config_text.config(state=tk.NORMAL)
+            self.config_text.delete(1.0, tk.END)
+            self.config_text.insert(tk.END, txt)
+            self.config_text.config(state=tk.DISABLED)
+            try:
+                self.stats_status.config(text="已更新网络设置")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.stats_status.config(text=f"网络设置失败：{e}")
+            except Exception:
+                pass
+
+    def netcheck_okx(self):
+        try:
+            try:
+                self.stats_status.config(text="正在网络自检(OKX)...")
+            except Exception:
+                pass
+            txt = _okx_network_diagnose()
+            self.config_text.config(state=tk.NORMAL)
+            self.config_text.delete(1.0, tk.END)
+            self.config_text.insert(tk.END, txt)
+            self.config_text.config(state=tk.DISABLED)
+            try:
+                self.stats_status.config(text="网络自检完成")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.stats_status.config(text=f"网络自检失败：{e}")
+            except Exception:
+                pass
+
+    def _cancel_autotrade_stats_refresh(self):
+        try:
+            if self._autotrade_stats_after_id is not None:
+                self.frame.after_cancel(self._autotrade_stats_after_id)
+        except Exception:
+            pass
+        self._autotrade_stats_after_id = None
+
+    def _schedule_autotrade_stats_refresh(self):
+        # 注意：只刷新本地统计，不会触发 API。
+        self._cancel_autotrade_stats_refresh()
+
+        def _tick():
+            try:
+                if self._trader and self._trader.is_running():
+                    self.update_stats()
+                    self._autotrade_stats_after_id = self.frame.after(self._autotrade_stats_interval_ms, _tick)
+                else:
+                    self._autotrade_stats_after_id = None
+            except Exception:
+                self._autotrade_stats_after_id = None
+
+        try:
+            self._autotrade_stats_after_id = self.frame.after(self._autotrade_stats_interval_ms, _tick)
+        except Exception:
+            self._autotrade_stats_after_id = None
+
+    def start_autotrade(self):
+        try:
+            if self._trader and self._trader.is_running():
+                self.stats_status.config(text="自动交易已在运行")
+                return
+
+            # 读取/检查 OKX keys（必要时弹窗输入）
+            okx = _get_okx_client_interactive(parent=self.frame.winfo_toplevel())
+
+            cfg = load_trade_config_from_env()
+
+            # 若未通过“⚙️交易设置/环境变量”显式设置过，给一次引导（默认 BTC-USDT）
+            if not cfg.inst_ids:
+                msg = _prompt_trade_settings(parent=self.frame.winfo_toplevel(), default_inst_ids=["BTC-USDT"], default_bar=cfg.bar)
+                try:
+                    self.stats_status.config(text=msg)
+                except Exception:
+                    pass
+                self._trade_log(msg)
+                cfg = load_trade_config_from_env()
+
+            if not cfg.inst_ids:
+                self.stats_status.config(text="未配置 OKX_SYMBOLS")
+                return
+
+            self._trade_logs = []
+            self._trade_log("🧪 将以 OKX 模拟盘模式运行（请求头 x-simulated-trading: 1）")
+            self._trade_log(f"启动参数：instIds={cfg.inst_ids} bar={cfg.bar} 每次买入≈{cfg.trade_quote} quote")
+
+            self._trader = AutoTrader(analyzer=self.analyzer, okx=okx, cfg=cfg, log=self._trade_log)
+            self._trader.start()
+            self._schedule_autotrade_stats_refresh()
+            self.stats_status.config(text="自动交易已启动（模拟盘）")
+        except Exception as e:
+            try:
+                self.stats_status.config(text=f"启动失败：{e}")
+            except Exception:
+                pass
+            self._trade_log(f"❌ 启动失败：{e}")
+
+    def stop_autotrade(self):
+        try:
+            self._cancel_autotrade_stats_refresh()
+            if not self._trader:
+                self.stats_status.config(text="自动交易未启动")
+                return
+            self._trader.stop()
+            self._trade_log("🟠 已请求停止自动交易")
+            self.stats_status.config(text="已请求停止自动交易")
+        except Exception as e:
+            try:
+                self.stats_status.config(text=f"停止失败：{e}")
+            except Exception:
+                pass
+
 
 class FallbackPanel:
     """兜底 UI：尽量不依赖 ttk。
@@ -239,6 +716,10 @@ class FallbackPanel:
         self.root = parent
         self.analyzer = analyzer
         self.budget = 1.0
+
+        # 自动交易（OKX 模拟盘）
+        self._trader: AutoTrader | None = None
+        self._trade_logs: list[str] = []
 
         # 输出区后端：默认用 Canvas（你之前那版能显示就是这套），可用环境变量切到 listbox。
         self._output_backend = (os.environ.get("FALLBACK_OUTPUT_BACKEND") or "canvas").strip().lower()
@@ -267,6 +748,140 @@ class FallbackPanel:
             self.status.configure(text=msg)
         except Exception:
             pass
+
+    def _trade_log(self, msg: str):
+        """自动交易日志：追加到输出区。"""
+        try:
+            from datetime import datetime
+
+            ts = datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            ts = ""
+
+        line = f"[{ts}] {msg}" if ts else str(msg)
+        self._trade_logs.append(line)
+        # 控制长度，避免 UI 渲染过慢
+        if len(self._trade_logs) > 200:
+            self._trade_logs = self._trade_logs[-200:]
+
+        # 刷新输出区
+        try:
+            self._render_output("\n".join(self._trade_logs), keep_view=False)
+        except Exception:
+            pass
+
+    def _cancel_autotrade_stats_refresh(self):
+        try:
+            if self._autotrade_stats_after_id is not None:
+                self.root.after_cancel(self._autotrade_stats_after_id)
+        except Exception:
+            pass
+        self._autotrade_stats_after_id = None
+
+    def _schedule_autotrade_stats_refresh(self):
+        # 注意：只刷新本地统计，不会触发 API。
+        self._cancel_autotrade_stats_refresh()
+
+        def _tick():
+            try:
+                if self._trader and self._trader.is_running():
+                    self.update_stats()
+                    self._autotrade_stats_after_id = self.root.after(self._autotrade_stats_interval_ms, _tick)
+                else:
+                    self._autotrade_stats_after_id = None
+            except Exception:
+                self._autotrade_stats_after_id = None
+
+        try:
+            self._autotrade_stats_after_id = self.root.after(self._autotrade_stats_interval_ms, _tick)
+        except Exception:
+            self._autotrade_stats_after_id = None
+
+    def _on_trade_settings(self):
+        try:
+            cfg = load_trade_config_from_env()
+            msg = _prompt_trade_settings(parent=self.root, default_inst_ids=cfg.inst_ids, default_bar=cfg.bar)
+            self._set_status(msg)
+            self._trade_log(msg)
+        except Exception as e:
+            self._set_status(f"交易设置失败：{e}")
+            self._render_output(f"❌ 交易设置失败：{e}")
+
+    def _start_autotrade(self):
+        """启动 OKX 模拟盘自动交易。"""
+        try:
+            if self._trader and self._trader.is_running():
+                self._set_status("自动交易已在运行")
+                return
+
+            # 读取/检查 OKX keys（必要时弹窗输入）
+            okx = _get_okx_client_interactive(parent=self.root)
+
+            cfg = load_trade_config_from_env()
+
+            # 允许用户在 macOS 下用系统弹窗快速覆盖 instIds 和 bar
+            if sys.platform == "darwin":
+                import subprocess
+
+                default_ids = ",".join(cfg.inst_ids) if cfg.inst_ids else "BTC-USDT"
+                script1 = f'text returned of (display dialog "请输入 OKX instId 列表（逗号/空格分隔）" default answer "{default_ids}")'
+                p1 = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        script1,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if p1.returncode == 0:
+                    inst_s = (p1.stdout or "").strip()
+                    inst_ids = parse_inst_ids(inst_s)
+                    if inst_ids:
+                        cfg.inst_ids = inst_ids
+
+                p2 = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'text returned of (display dialog "请输入 bar（例如 1H/15m/1D；也可填 1h/1d）" default answer "{cfg.bar}")',
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if p2.returncode == 0:
+                    bar = (p2.stdout or "").strip()
+                    if bar:
+                        cfg.bar = bar
+
+            if not cfg.inst_ids:
+                self._set_status("未配置 OKX_SYMBOLS")
+                return
+
+            self._trade_logs = []
+            self._trade_log("🧪 将以 OKX 模拟盘模式运行（请求头 x-simulated-trading: 1）")
+            self._trade_log(f"启动参数：instIds={cfg.inst_ids} bar={cfg.bar} 每次买入≈{cfg.trade_quote} quote")
+
+            self._trader = AutoTrader(analyzer=self.analyzer, okx=okx, cfg=cfg, log=self._trade_log)
+            self._trader.start()
+            self._set_status("自动交易已启动（模拟盘）")
+        except Exception as e:
+            self._set_status(f"启动失败：{e}")
+            self._render_output(f"❌ 启动自动交易失败：{e}")
+
+    def _stop_autotrade(self):
+        try:
+            if not self._trader:
+                self._set_status("自动交易未启动")
+                return
+            self._cancel_autotrade_stats_refresh()
+            self._trader.stop()
+            self._set_status("已请求停止自动交易")
+            self._trade_log("🟠 已请求停止自动交易")
+        except Exception as e:
+            self._set_status(f"停止失败：{e}")
 
     def _as_label_button(self, parent, text: str, bold: bool = False):
         font = ("Arial", 11, "bold") if bold else ("Arial", 11)
@@ -333,6 +948,9 @@ class FallbackPanel:
         tk.Button(row, text="修改预算", command=self._on_prompt_budget).pack(side=tk.LEFT)
         tk.Button(row, text="计算优化配置", command=self._on_calculate).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(row, text="📈 市场分析", command=self._on_market_analyze).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(row, text="⚙️ 交易设置", command=self._on_trade_settings).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(row, text="▶️ 启动自动交易(模拟盘)", command=self._start_autotrade).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(row, text="⏹ 停止自动交易", command=self._stop_autotrade).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(row, text="🔄 刷新成本统计", command=self._on_refresh).pack(side=tk.LEFT, padx=(8, 0))
 
         # 状态提示：也用 Button（Label 在你环境里可能不可见）
@@ -708,7 +1326,7 @@ class FallbackPanel:
                     [
                         "osascript",
                         "-e",
-                        'text returned of (display dialog "请输入周期（例如 1m/5m/15m/1h/1d）" default answer "1h")',
+                        'text returned of (display dialog "请输入周期（例如 1m/5m/15m/1h/1H/1d/1D）" default answer "1h")',
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -728,26 +1346,48 @@ class FallbackPanel:
                     self._set_status("已取消市场分析")
                     return
 
+            import re
+
+            symbols = [s.strip().upper().replace("/", "") for s in re.split(r"[,\s]+", symbol or "") if s.strip()]
+
             # 2) 执行分析
             self._set_status("正在分析中（会调用 API）...")
-            r = self.analyzer.analyze_market_from_binance(symbol=symbol, timeframe=timeframe, limit=200, force_analysis=True)
 
-            # 3) 渲染输出
-            lines = [
-                f"📈 市场分析结果（{symbol.upper()} {timeframe} / source={r.get('source')}）",
-                f"- recommendation: {r.get('recommendation')}",
-                f"- confidence: {r.get('confidence')}",
-                f"- status: {r.get('status')}",
-            ]
-            if r.get("target_price") is not None:
-                lines.append(f"- target_price: {r.get('target_price')}")
-            if r.get("stop_loss") is not None:
-                lines.append(f"- stop_loss: {r.get('stop_loss')}")
-            if r.get("raw_analysis"):
-                lines.append("\n--- raw_analysis ---")
-                lines.append(str(r.get("raw_analysis")))
+            if len(symbols) > 1:
+                batch = self.analyzer.analyze_markets_from_binance(symbols=symbols, timeframe=timeframe, limit=200, force_analysis=True)
+                results = batch.get("results") or {}
 
-            self._render_output("\n".join(lines))
+                lines = [f"📈 批量市场分析（{timeframe} / source={batch.get('source')}）"]
+                for sym in symbols:
+                    r = results.get(sym) or {}
+                    reason = r.get("reason") or r.get("message") or ""
+                    lines.append(
+                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} confidence={r.get('confidence')} {reason}".strip()
+                    )
+                    if r.get("raw_analysis"):
+                        lines.append(str(r.get("raw_analysis")))
+
+                self._render_output("\n".join(lines))
+            else:
+                one = symbols[0] if symbols else (symbol or "")
+                r = self.analyzer.analyze_market_from_binance(symbol=one, timeframe=timeframe, limit=200, force_analysis=True)
+
+                # 3) 渲染输出
+                lines = [
+                    f"📈 市场分析结果（{one.upper()} {timeframe} / source={r.get('source')}）",
+                    f"- recommendation: {r.get('recommendation')}",
+                    f"- confidence: {r.get('confidence')}",
+                    f"- status: {r.get('status')}",
+                ]
+                if r.get("target_price") is not None:
+                    lines.append(f"- target_price: {r.get('target_price')}")
+                if r.get("stop_loss") is not None:
+                    lines.append(f"- stop_loss: {r.get('stop_loss')}")
+                if r.get("raw_analysis"):
+                    lines.append("\n--- raw_analysis ---")
+                    lines.append(str(r.get("raw_analysis")))
+
+                self._render_output("\n".join(lines))
             self._set_status("市场分析完成")
 
             # 4) 刷新成本统计
@@ -759,6 +1399,25 @@ class FallbackPanel:
         except Exception as e:
             self._set_status(f"市场分析失败：{e}")
             self._render_output(f"❌ 市场分析失败：{e}")
+
+    def _on_prompt_network(self):
+        try:
+            txt = _prompt_network_settings(parent=self.root)
+            self._set_status("已更新网络设置")
+            self._render_output(txt)
+        except Exception as e:
+            self._set_status(f"网络设置失败：{e}")
+            self._render_output(f"❌ 网络设置失败：{e}")
+
+    def _on_netcheck_okx(self):
+        try:
+            self._set_status("正在网络自检(OKX)...")
+            txt = _okx_network_diagnose()
+            self._render_output(txt)
+            self._set_status("网络自检完成")
+        except Exception as e:
+            self._set_status(f"网络自检失败：{e}")
+            self._render_output(f"❌ 网络自检失败：{e}")
 
     def _on_refresh(self):
         try:
@@ -788,11 +1447,21 @@ class FallbackPanel:
         self.avg_cost.configure(text=f"${summary['avg_cost_per_call']:.6f}")
         self.total_tokens.configure(text=str(summary["total_tokens"]))
 
+        # 预算告警（兜底 UI 用 status 区提示）
+        try:
+            if summary.get("daily_budget"):
+                if summary.get("budget_exceeded"):
+                    self._set_status(
+                        f"⚠️ 今日成本 ${summary['today_cost']:.4f} 已超预算 ${float(summary['daily_budget']):.2f}（{summary.get('budget_enforcement')}）"
+                    )
+        except Exception:
+            pass
+
     def _calculate_optimization(self):
         try:
-            from deepseek_analyzer_optimized import CostOptimizationStrategy
-
-            config = CostOptimizationStrategy.get_recommended_config(float(self.budget))
+            # 让预算配置真实作用到分析器（缓存 TTL / 阈值 / 频率限制 / 预算告警）
+            enforcement = (os.environ.get("BUDGET_ENFORCEMENT") or "warn").strip().lower()
+            config = self.analyzer.apply_budget(float(self.budget), enforcement=enforcement)
             txt = (
                 f"📊 基于日预算 ${self.budget:.2f} 的优化建议：\n\n"
                 f"✓ 平均成本/次: ${config['avg_cost_per_call']:.6f}\n"
