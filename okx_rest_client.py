@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import requests
+from urllib.parse import urlencode
 
 
 @dataclass
