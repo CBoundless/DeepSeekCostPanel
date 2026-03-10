@@ -19,6 +19,8 @@ Env vars:
 - OKX_CONF_THRESHOLD: default 65
 - OKX_LOOP_SECONDS: default 60
 - OKX_MAX_POSITIONS: default 1 (最多同时持有几个币)
+- OKX_ORDER_CHECK_RETRIES: default 5 (下单后最多轮询几次订单状态)
+- OKX_ORDER_CHECK_INTERVAL_MS: default 1000 (每次轮询间隔毫秒)
 
 Dynamic position (持仓管理):
 - OKX_STOP_LOSS_PCT: default 0.02 (2%)
@@ -79,6 +81,8 @@ class TradeConfig:
     conf_threshold: int = 65
     loop_seconds: int = 60
     max_positions: int = 1
+    order_check_retries: int = 5
+    order_check_interval_ms: int = 1000
 
     # dynamic position management
     stop_loss_pct: float = 0.02
@@ -225,6 +229,112 @@ class AutoTrader:
         pos.entry_price = None
         pos.peak_price = None
 
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_order_summary(order: Optional[Dict[str, Any]]) -> str:
+        if not order:
+            return "order=unavailable"
+        parts: List[str] = []
+        for key in ("ordId", "clOrdId", "state", "side", "ordType"):
+            value = order.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={value}")
+        for key in ("sz", "accFillSz", "fillSz", "avgPx", "fillPx", "fee"):
+            value = order.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={value}")
+        return " ".join(parts) if parts else str(order)
+
+    @staticmethod
+    def _extract_submit_error(first: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(first, dict):
+            return ""
+        s_code = str(first.get("sCode") or "0")
+        if s_code and s_code != "0":
+            return f"OKX order rejected sCode={s_code} sMsg={first.get('sMsg')}"
+        return ""
+
+    def _get_balance_snapshot(self, inst_id: str) -> Optional[Dict[str, Dict[str, Optional[float]]]]:
+        if "-" in inst_id:
+            base_ccy, quote_ccy = inst_id.split("-", 1)
+        else:
+            base_ccy, quote_ccy = inst_id, "USDT"
+        ccy = f"{base_ccy.upper()},{quote_ccy.upper()}"
+        payload = self.okx.get_balance(ccy=ccy)
+        if not isinstance(payload, dict) or str(payload.get("code")) != "0":
+            self.log(f"[{inst_id}] ⚠️ 余额查询失败 payload={payload}")
+            return None
+
+        details: List[Dict[str, Any]] = []
+        try:
+            data = payload.get("data") or []
+            if data and isinstance(data, list):
+                details = (data[0] or {}).get("details") or []
+        except Exception:
+            details = []
+
+        snapshot: Dict[str, Dict[str, Optional[float]]] = {}
+        for item_ccy in (base_ccy.upper(), quote_ccy.upper()):
+            hit = next((d for d in details if str(d.get("ccy")).upper() == item_ccy), None) or {}
+            snapshot[item_ccy] = {
+                "availBal": self._to_float(hit.get("availBal")),
+                "cashBal": self._to_float(hit.get("cashBal")),
+                "eq": self._to_float(hit.get("eq")),
+                "frozenBal": self._to_float(hit.get("frozenBal")),
+            }
+        return snapshot
+
+    @staticmethod
+    def _format_balance_snapshot(snapshot: Optional[Dict[str, Dict[str, Optional[float]]]]) -> str:
+        if not snapshot:
+            return "snapshot=unavailable"
+        parts: List[str] = []
+        for ccy, values in snapshot.items():
+            parts.append(
+                f"{ccy}(avail={values.get('availBal') if values.get('availBal') is not None else 'n/a'}, "
+                f"cash={values.get('cashBal') if values.get('cashBal') is not None else 'n/a'}, "
+                f"eq={values.get('eq') if values.get('eq') is not None else 'n/a'})"
+            )
+        return "; ".join(parts)
+
+    def _verify_order_state(
+        self,
+        inst_id: str,
+        *,
+        ord_id: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        if not ord_id and not cl_ord_id:
+            return None, "缺少 ordId/clOrdId"
+
+        attempts = max(1, int(self.cfg.order_check_retries))
+        interval_seconds = max(0, int(self.cfg.order_check_interval_ms)) / 1000.0
+        last_order: Optional[Dict[str, Any]] = None
+        last_err = ""
+
+        for attempt in range(1, attempts + 1):
+            payload = self.okx.get_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+            order, err = okx_extract_first_data(payload)
+            if err:
+                last_err = err
+            elif order:
+                last_order = order
+                state = str(order.get("state") or "").lower()
+                if state in ("filled", "canceled", "cancelled", "mmp_canceled"):
+                    return order, ""
+            if attempt < attempts and interval_seconds > 0:
+                time.sleep(interval_seconds)
+
+        return last_order, last_err
+
     def _should_force_exit_by_risk(self, inst: str, pos: PositionState) -> bool:
         """风控触发：止损 or 移动止盈。
 
@@ -259,6 +369,7 @@ class AutoTrader:
         self.log(
             f"instIds={self.cfg.inst_ids} bar={self.cfg.bar} loop={self.cfg.loop_seconds}s conf>={self.cfg.conf_threshold} "
             f"trade_quote={self.cfg.trade_quote} max_positions={self.cfg.max_positions} "
+            f"order_check_retries={self.cfg.order_check_retries} order_check_interval_ms={self.cfg.order_check_interval_ms} "
             f"stop_loss={self.cfg.stop_loss_pct} trailing_stop={self.cfg.trailing_stop_pct} "
             f"trailing_activate={self.cfg.trailing_activate_pct} exit_on_ai_sell={self.cfg.exit_on_ai_sell}"
         )
@@ -366,7 +477,7 @@ class AutoTrader:
             if r.get("status") != "success":
                 reason = r.get("reason") or r.get("message") or ""
                 if pos.holding and self._should_force_exit_by_risk(inst, pos):
-                    ok = self._close_long_spot(inst)
+                    ok, _close_info = self._close_long_spot(inst)
                     if ok:
                         self._reset_position(pos)
                 else:
@@ -385,7 +496,7 @@ class AutoTrader:
 
             # 先做风控：止损/移动止盈（不依赖 AI）
             if pos.holding and self._should_force_exit_by_risk(inst, pos):
-                ok = self._close_long_spot(inst)
+                ok, _close_info = self._close_long_spot(inst)
                 if ok:
                     self._reset_position(pos)
                 continue
@@ -399,7 +510,7 @@ class AutoTrader:
                 continue
 
             if rec == "SELL" and pos.holding and bool(self.cfg.exit_on_ai_sell):
-                ok = self._close_long_spot(inst)
+                ok, _close_info = self._close_long_spot(inst)
                 if ok:
                     self._reset_position(pos)
                 else:
@@ -440,23 +551,30 @@ class AutoTrader:
 
             pos = self._pos.get(inst) or PositionState()
             self._pos[inst] = pos
-            ok = self._open_long_spot(inst)
+            ok, open_info = self._open_long_spot(inst)
             if ok:
                 opened += 1
                 pos.holding = True
-                if pos.last_price is not None:
-                    pos.entry_price = float(pos.last_price)
-                    pos.peak_price = float(pos.last_price)
+                avg_px = self._to_float((open_info or {}).get("avgPx"))
+                fill_px = self._to_float((open_info or {}).get("fillPx"))
+                entry_px = avg_px or fill_px or pos.last_price
+                if entry_px is not None:
+                    pos.entry_price = float(entry_px)
+                    pos.peak_price = float(entry_px)
                 self._log_position(inst, pos, note=f"按置信度排名第 {rank} 开仓(conf={conf}){_fmt_meta(r)}")
 
-    def _open_long_spot(self, inst_id: str) -> bool:
+    def _open_long_spot(self, inst_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         # Market buy using quote amount (USDT) by default
         quote = float(self.cfg.trade_quote)
         if quote <= 0:
             self.log(f"[{inst_id}] ❌ trade_quote<=0，跳过")
-            return False
+            return False, None
+
+        before_snapshot = self._get_balance_snapshot(inst_id)
+        self.log(f"[{inst_id}] 💰 BUY 前余额：{self._format_balance_snapshot(before_snapshot)}")
 
         clid = f"ds-{int(time.time())}-{inst_id.replace('-', '')[:10]}"[-32:]
+        self.log(f"[{inst_id}] 🚀 提交 BUY 市价单 quote={quote} clOrdId={clid}")
         payload = self.okx.place_order(
             inst_id=inst_id,
             td_mode=self.cfg.td_mode,
@@ -469,14 +587,38 @@ class AutoTrader:
         first, err = okx_extract_first_data(payload)
         if err:
             self.log(f"[{inst_id}] ❌ BUY failed: {err} payload={payload}")
-            return False
+            return False, None
 
-        self.log(f"[{inst_id}] ✅ BUY market (quote={quote}) ordId={first.get('ordId') if first else ''}")
-        return True
+        submit_err = self._extract_submit_error(first)
+        if submit_err:
+            self.log(f"[{inst_id}] ❌ BUY rejected: {submit_err} payload={payload}")
+            return False, first
 
-    def _close_long_spot(self, inst_id: str) -> bool:
+        ord_id = (first or {}).get("ordId") if isinstance(first, dict) else None
+        self.log(f"[{inst_id}] 🟢 BUY 已受理 ordId={ord_id} clOrdId={clid}")
+
+        order_info, verify_err = self._verify_order_state(inst_id, ord_id=str(ord_id) if ord_id else None, cl_ord_id=clid)
+        if order_info:
+            state = str(order_info.get("state") or "unknown").lower()
+            summary = self._format_order_summary(order_info)
+            if state == "filled":
+                self.log(f"[{inst_id}] ✅ BUY 已确认成交 {summary}")
+            elif state in ("canceled", "cancelled", "mmp_canceled"):
+                self.log(f"[{inst_id}] ⚠️ BUY 已受理但最终未成交 state={state} {summary}")
+            else:
+                self.log(f"[{inst_id}] ⏳ BUY 已受理，暂未确认最终状态 {summary}")
+        elif verify_err:
+            self.log(f"[{inst_id}] ⚠️ BUY 已受理，但订单查询失败：{verify_err}")
+
+        after_snapshot = self._get_balance_snapshot(inst_id)
+        self.log(f"[{inst_id}] 💰 BUY 后余额：{self._format_balance_snapshot(after_snapshot)}")
+        return True, (order_info or first)
+
+    def _close_long_spot(self, inst_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         # Sell available base asset amount from balance
         base_ccy = inst_id.split("-")[0].upper() if "-" in inst_id else inst_id.upper()
+        before_snapshot = self._get_balance_snapshot(inst_id)
+        self.log(f"[{inst_id}] 💰 SELL 前余额：{self._format_balance_snapshot(before_snapshot)}")
         bal = self.okx.get_balance(ccy=base_ccy)
 
         # OKX balance response nesting differs across accounts; do best-effort extraction
@@ -497,9 +639,10 @@ class AutoTrader:
 
         if not sell_sz or sell_sz in ("0", "0.0", "0.00"):
             self.log(f"[{inst_id}] ⚠️ 未找到可卖数量（base={base_ccy}），跳过平仓 payload={bal}")
-            return False
+            return False, None
 
         clid = f"ds-{int(time.time())}-{base_ccy}"[-32:]
+        self.log(f"[{inst_id}] 🚀 提交 SELL 市价单 sz={sell_sz} {base_ccy} clOrdId={clid}")
         payload = self.okx.place_order(
             inst_id=inst_id,
             td_mode=self.cfg.td_mode,
@@ -511,10 +654,32 @@ class AutoTrader:
         first, err = okx_extract_first_data(payload)
         if err:
             self.log(f"[{inst_id}] ❌ SELL failed: {err} payload={payload}")
-            return False
+            return False, None
 
-        self.log(f"[{inst_id}] ✅ SELL market (sz={sell_sz} {base_ccy}) ordId={first.get('ordId') if first else ''}")
-        return True
+        submit_err = self._extract_submit_error(first)
+        if submit_err:
+            self.log(f"[{inst_id}] ❌ SELL rejected: {submit_err} payload={payload}")
+            return False, first
+
+        ord_id = (first or {}).get("ordId") if isinstance(first, dict) else None
+        self.log(f"[{inst_id}] 🟢 SELL 已受理 ordId={ord_id} clOrdId={clid}")
+
+        order_info, verify_err = self._verify_order_state(inst_id, ord_id=str(ord_id) if ord_id else None, cl_ord_id=clid)
+        if order_info:
+            state = str(order_info.get("state") or "unknown").lower()
+            summary = self._format_order_summary(order_info)
+            if state == "filled":
+                self.log(f"[{inst_id}] ✅ SELL 已确认成交 {summary}")
+            elif state in ("canceled", "cancelled", "mmp_canceled"):
+                self.log(f"[{inst_id}] ⚠️ SELL 已受理但最终未成交 state={state} {summary}")
+            else:
+                self.log(f"[{inst_id}] ⏳ SELL 已受理，暂未确认最终状态 {summary}")
+        elif verify_err:
+            self.log(f"[{inst_id}] ⚠️ SELL 已受理，但订单查询失败：{verify_err}")
+
+        after_snapshot = self._get_balance_snapshot(inst_id)
+        self.log(f"[{inst_id}] 💰 SELL 后余额：{self._format_balance_snapshot(after_snapshot)}")
+        return True, (order_info or first)
 
 
 def load_trade_config_from_env() -> TradeConfig:
@@ -527,6 +692,8 @@ def load_trade_config_from_env() -> TradeConfig:
     conf_threshold = int(float(os.environ.get("OKX_CONF_THRESHOLD") or 65))
     loop_seconds = int(float(os.environ.get("OKX_LOOP_SECONDS") or 60))
     max_positions = max(1, int(float(os.environ.get("OKX_MAX_POSITIONS") or 1)))
+    order_check_retries = max(1, int(float(os.environ.get("OKX_ORDER_CHECK_RETRIES") or 5)))
+    order_check_interval_ms = max(0, int(float(os.environ.get("OKX_ORDER_CHECK_INTERVAL_MS") or 1000)))
 
     stop_loss_pct = float(os.environ.get("OKX_STOP_LOSS_PCT") or 0.02)
     trailing_stop_pct = float(os.environ.get("OKX_TRAILING_STOP_PCT") or 0.01)
@@ -543,6 +710,8 @@ def load_trade_config_from_env() -> TradeConfig:
         conf_threshold=conf_threshold,
         loop_seconds=loop_seconds,
         max_positions=max_positions,
+        order_check_retries=order_check_retries,
+        order_check_interval_ms=order_check_interval_ms,
         stop_loss_pct=stop_loss_pct,
         trailing_stop_pct=trailing_stop_pct,
         trailing_activate_pct=trailing_activate_pct,

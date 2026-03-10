@@ -345,6 +345,22 @@ class OKXClient:
         params = {"ccy": ccy} if ccy else None
         return self._request("GET", "/api/v5/account/balance", params=params)
 
+    def get_order(
+        self,
+        *,
+        inst_id: str,
+        ord_id: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        # GET /api/v5/trade/order?instId=BTC-USDT&ordId=123456
+        self.require_auth()
+        params: Dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        if cl_ord_id:
+            params["clOrdId"] = cl_ord_id
+        return self._request("GET", "/api/v5/trade/order", params=params)
+
     def place_order(
         self,
         *,
