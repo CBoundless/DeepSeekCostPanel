@@ -244,13 +244,19 @@ class OKXClient:
         request_path = path if path.startswith("/") else f"/{path}"
 
         body = ""
-        json_body = None
+        raw_body = None
         if data is not None:
-            # OKX expects JSON body for POST endpoints
+            # OKX 签名要求 body 与实际发送内容完全一致，不能让 requests 再次序列化。
             body = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-            json_body = data
+            raw_body = body.encode("utf-8")
 
-        headers = self._headers(method, request_path, body)
+        signed_path = request_path
+        if params:
+            query = urlencode([(str(k), "" if v is None else str(v)) for k, v in params.items()])
+            if query:
+                signed_path = f"{request_path}?{query}"
+
+        headers = self._headers(method, signed_path, body)
 
         errs: list[str] = []
         for base in (self.base_urls or [self.base_url]):
@@ -260,7 +266,7 @@ class OKXClient:
                     method=method.upper(),
                     url=url,
                     params=params,
-                    json=json_body,
+                    data=raw_body,
                     headers=headers,
                     timeout=self.timeout,
                     proxies=self.proxies,
