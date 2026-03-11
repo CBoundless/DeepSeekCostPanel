@@ -174,13 +174,18 @@ def _build_okx_client() -> OKXClient:
 def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnalyzer, okx: OKXClient) -> None:
     cfg = load_trade_config_from_env()
     budget = analyzer.config.daily_budget
+    max_positions_label = "不限" if cfg.max_positions <= 0 else cfg.max_positions
     logger.info(
-        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s max_positions=%s order_check_retries=%s order_check_interval_ms=%s simulated=%s",
+        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s max_positions=%s dynamic_enabled=%s market_quality_threshold=%s dynamic_factor=[%s,%s] order_check_retries=%s order_check_interval_ms=%s simulated=%s",
         cfg.inst_ids,
         cfg.bar,
         cfg.loop_seconds,
         cfg.trade_quote,
-        cfg.max_positions,
+        max_positions_label,
+        cfg.dynamic_position_enabled,
+        cfg.market_quality_threshold,
+        cfg.dynamic_min_factor,
+        cfg.dynamic_max_factor,
         cfg.order_check_retries,
         cfg.order_check_interval_ms,
         okx.simulated_trading,
@@ -212,8 +217,6 @@ def _validate_config(logger: logging.Logger) -> tuple[OptimizedDeepSeekAnalyzer,
         raise RuntimeError("OKX_TRADE_QUOTE 必须大于 0")
     if cfg.loop_seconds <= 0:
         raise RuntimeError("OKX_LOOP_SECONDS 必须大于 0")
-    if cfg.max_positions <= 0:
-        raise RuntimeError("OKX_MAX_POSITIONS 必须大于 0")
 
     _log_runtime_summary(logger, analyzer, okx)
     return analyzer, okx

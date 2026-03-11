@@ -7,6 +7,7 @@
 import requests
 import json
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -132,6 +133,37 @@ def _macd_last(closes: List[float], fast: int = 12, slow: int = 26, signal: int 
     signal_v = signal_line[-1] if signal_line else None
     hist_v = (macd_v - signal_v) if (macd_v is not None and signal_v is not None) else None
     return macd_v, signal_v, hist_v
+
+
+def _pct_change(values: List[float], lookback: int) -> Optional[float]:
+    if lookback <= 0 or len(values) <= lookback:
+        return None
+    base = float(values[-lookback - 1])
+    last = float(values[-1])
+    if base == 0:
+        return None
+    return (last - base) / base
+
+
+def _returns_volatility(values: List[float], lookback: int = 20) -> Optional[float]:
+    if lookback <= 1 or len(values) <= lookback:
+        return None
+
+    returns: List[float] = []
+    recent = values[-(lookback + 1):]
+    for prev, curr in zip(recent, recent[1:]):
+        prev_f = float(prev)
+        curr_f = float(curr)
+        if prev_f <= 0:
+            continue
+        returns.append((curr_f - prev_f) / prev_f)
+
+    if len(returns) < 2:
+        return None
+
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+    return math.sqrt(max(variance, 0.0))
 
 
 class CostTracker:
@@ -595,8 +627,15 @@ class OptimizedDeepSeekAnalyzer:
         ema_50 = _ema_last(closes, 50)
         rsi_14 = _rsi_last(closes, 14)
         macd, macd_signal, macd_hist = _macd_last(closes)
+        last_close = float(closes[-1]) if closes else 0.0
+        close_change_pct_20 = _pct_change(closes, 20)
+        volatility_20 = _returns_volatility(closes, 20)
 
-        # 与旧逻辑字段名保持一致
+        ema_spread_pct = None
+        if ema_9 is not None and ema_50 is not None and last_close > 0:
+            ema_spread_pct = (float(ema_9) - float(ema_50)) / last_close
+
+        # 与旧逻辑字段名保持一致，并补充动态仓位所需指标
         return {
             "ema_9": float(ema_9) if ema_9 is not None else 0.0,
             "ema_20": float(ema_20) if ema_20 is not None else 0.0,
@@ -605,6 +644,10 @@ class OptimizedDeepSeekAnalyzer:
             "macd": float(macd) if macd is not None else 0.0,
             "macd_signal": float(macd_signal) if macd_signal is not None else 0.0,
             "macd_hist": float(macd_hist) if macd_hist is not None else 0.0,
+            "last_close": last_close,
+            "close_change_pct_20": float(close_change_pct_20) if close_change_pct_20 is not None else 0.0,
+            "volatility_20": float(volatility_20) if volatility_20 is not None else 0.0,
+            "ema_spread_pct": float(ema_spread_pct) if ema_spread_pct is not None else 0.0,
         }
 
     def analyze_market_from_okx(
@@ -791,7 +834,7 @@ class OptimizedDeepSeekAnalyzer:
         per_tokens = int(total_tokens / max(1, len(pending)))
         fallback_candidates: List[Tuple[str, List[List], Dict]] = []
 
-        for inst, ohlcv, indicators, _q in pending:
+        for inst, ohlcv, indicators, signal_quality in pending:
             item = parsed.get(inst)
             if not isinstance(item, dict) or not item:
                 out = {
@@ -821,10 +864,14 @@ class OptimizedDeepSeekAnalyzer:
             out["budget"] = self._get_budget_state()
             out["market_source"] = "okx"
             out["inst_id"] = inst
+            out["signal_quality"] = float(signal_quality)
+            out["indicators"] = indicators
+            out["ohlcv_points"] = len(ohlcv)
 
             if out.get("status") == "success":
                 self.cache.set(inst, tf_for_cache, indicators, dict(out))
             results[inst] = out
+
 
         fallback_limit = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
         fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and fallback_limit > 0

@@ -115,6 +115,7 @@ def _prompt_trade_settings(*, parent: tk.Misc | None = None, default_inst_ids: l
 
     - instIds 支持 `btc`/`eth` 这种简写，会自动映射成 `BTC-USDT`。
     - bar 支持 `1h/1H/15m/1D` 等。
+    - 同时可快速调整基础单笔金额、最大持仓数与动态仓位开关。
     """
 
     def _ask(title: str, prompt: str, default: str = "") -> str | None:
@@ -140,6 +141,9 @@ def _prompt_trade_settings(*, parent: tk.Misc | None = None, default_inst_ids: l
 
     inst_default = ",".join(default_inst_ids or []) if default_inst_ids else (os.environ.get("OKX_SYMBOLS") or default_okx_symbols_env_value())
     bar_default = (default_bar or os.environ.get("OKX_BAR") or "1H").strip()
+    quote_default = (os.environ.get("OKX_TRADE_QUOTE") or "15").strip()
+    max_positions_default = (os.environ.get("OKX_MAX_POSITIONS") or "2").strip()
+    dynamic_default = (os.environ.get("OKX_DYNAMIC_POSITION_ENABLED") or "1").strip()
 
     inst_raw = _ask("交易设置", "请输入交易标的（支持 btc/eth 或 BTC-USDT；逗号/空格分隔）：", default=inst_default)
     if inst_raw is None:
@@ -157,11 +161,29 @@ def _prompt_trade_settings(*, parent: tk.Misc | None = None, default_inst_ids: l
     if not bar:
         return "❌ 交易设置失败：bar 不能为空"
 
+    trade_quote = _ask("交易设置", "请输入基础单笔金额（USDT，例如 15）：", default=quote_default)
+    if trade_quote is None:
+        return "已取消交易设置"
+
+    max_positions = _ask("交易设置", "请输入最大持仓数（例如 2）：", default=max_positions_default)
+    if max_positions is None:
+        return "已取消交易设置"
+
+    dynamic_enabled = _ask("交易设置", "是否启用动态仓位？1=启用，0=关闭：", default=dynamic_default)
+    if dynamic_enabled is None:
+        return "已取消交易设置"
+
     # 写入本进程环境变量（AutoTrader 启动时会读取）
     os.environ["OKX_SYMBOLS"] = ",".join(inst_ids)
     os.environ["OKX_BAR"] = bar
+    os.environ["OKX_TRADE_QUOTE"] = (trade_quote or "15").strip() or "15"
+    os.environ["OKX_MAX_POSITIONS"] = (max_positions or "2").strip() or "2"
+    os.environ["OKX_DYNAMIC_POSITION_ENABLED"] = (dynamic_enabled or "1").strip() or "1"
 
-    return f"✅ 已更新自动交易设置：instIds={inst_ids} bar={bar}（仅本次运行有效）"
+    return (
+        f"✅ 已更新自动交易设置：instIds={inst_ids} bar={bar} trade_quote={os.environ['OKX_TRADE_QUOTE']} "
+        f"max_positions={os.environ['OKX_MAX_POSITIONS']} dynamic_position={os.environ['OKX_DYNAMIC_POSITION_ENABLED']}（仅本次运行有效）"
+    )
 
 
 def _current_network_env_summary() -> str:
@@ -458,9 +480,17 @@ class CostControlPanel:
                 for sym in symbols:
                     r = results.get(sym) or {}
                     reason = r.get("reason") or r.get("message") or ""
-                    lines.append(
-                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} confidence={r.get('confidence')} {reason}".strip()
-                    )
+                    line = (
+                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} "
+                        f"confidence={r.get('confidence')} signal_quality={r.get('signal_quality')} {reason}"
+                    ).strip()
+                    lines.append(line)
+                    indicators = r.get("indicators") or {}
+                    if indicators:
+                        lines.append(
+                            f"  indicators: ema9={indicators.get('ema_9')} ema20={indicators.get('ema_20')} ema50={indicators.get('ema_50')} "
+                            f"rsi14={indicators.get('rsi_14')} macd_hist={indicators.get('macd_hist')} vol20={indicators.get('volatility_20')}"
+                        )
                     if r.get("raw_analysis"):
                         lines.append(str(r.get("raw_analysis")))
 
@@ -468,11 +498,15 @@ class CostControlPanel:
             else:
                 one = symbols[0] if symbols else (symbol or "")
                 result = self.analyzer.analyze_market_from_binance(symbol=one, timeframe=timeframe, limit=200, force_analysis=True)
+                indicators = result.get("indicators") or {}
                 txt = (
                     f"📈 市场分析结果（{one.upper()} {timeframe} / source={result.get('source')}）\n\n"
                     f"recommendation: {result.get('recommendation')}\n"
                     f"confidence: {result.get('confidence')}\n"
-                    f"status: {result.get('status')}\n\n"
+                    f"signal_quality: {result.get('signal_quality')}\n"
+                    f"status: {result.get('status')}\n"
+                    f"indicators: ema9={indicators.get('ema_9')} ema20={indicators.get('ema_20')} ema50={indicators.get('ema_50')} "
+                    f"rsi14={indicators.get('rsi_14')} macd_hist={indicators.get('macd_hist')} vol20={indicators.get('volatility_20')}\n\n"
                     f"raw_analysis:\n{result.get('raw_analysis') or ''}"
                 )
 
@@ -1361,9 +1395,17 @@ class FallbackPanel:
                 for sym in symbols:
                     r = results.get(sym) or {}
                     reason = r.get("reason") or r.get("message") or ""
-                    lines.append(
-                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} confidence={r.get('confidence')} {reason}".strip()
-                    )
+                    line = (
+                        f"\n[{sym}] source={r.get('source')} status={r.get('status')} recommendation={r.get('recommendation')} "
+                        f"confidence={r.get('confidence')} signal_quality={r.get('signal_quality')} {reason}"
+                    ).strip()
+                    lines.append(line)
+                    indicators = r.get("indicators") or {}
+                    if indicators:
+                        lines.append(
+                            f"  indicators: ema9={indicators.get('ema_9')} ema20={indicators.get('ema_20')} ema50={indicators.get('ema_50')} "
+                            f"rsi14={indicators.get('rsi_14')} macd_hist={indicators.get('macd_hist')} vol20={indicators.get('volatility_20')}"
+                        )
                     if r.get("raw_analysis"):
                         lines.append(str(r.get("raw_analysis")))
 
@@ -1379,6 +1421,14 @@ class FallbackPanel:
                     f"- confidence: {r.get('confidence')}",
                     f"- status: {r.get('status')}",
                 ]
+                if r.get("signal_quality") is not None:
+                    lines.append(f"- signal_quality: {r.get('signal_quality')}")
+                indicators = r.get("indicators") or {}
+                if indicators:
+                    lines.append(
+                        f"- indicators: ema9={indicators.get('ema_9')} ema20={indicators.get('ema_20')} ema50={indicators.get('ema_50')} "
+                        f"rsi14={indicators.get('rsi_14')} macd_hist={indicators.get('macd_hist')} vol20={indicators.get('volatility_20')}"
+                    )
                 if r.get("target_price") is not None:
                     lines.append(f"- target_price: {r.get('target_price')}")
                 if r.get("stop_loss") is not None:
