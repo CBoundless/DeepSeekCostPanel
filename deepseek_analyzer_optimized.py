@@ -694,6 +694,7 @@ class OptimizedDeepSeekAnalyzer:
         bar: str,
         limit: int = 200,
         force_analysis: bool = False,
+        portfolio_context: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         """批量市场分析（OKX）：对多个 instId 只调用一次 DeepSeek（显著省钱）。
 
@@ -701,6 +702,7 @@ class OptimizedDeepSeekAnalyzer:
             inst_ids: 例如 ["BTC-USDT", "ETH-USDT"]
             okx_client: `okx_rest_client.OKXClient` 实例（用于拉取 K 线；可无鉴权）
             bar: OKX bar（例如 1H/15m/1D）。为了兼容 GUI，允许你传入本项目 timeframe（1h/1d），这里会自动兼容。
+            portfolio_context: 可选的账户组合摘要，用于让模型结合当前持仓/资金给出金额建议。
         """
         # 兼容：`bar` 既可能是 OKX bar（1H/1D），也可能是本项目 timeframe（1h/1d）。
         # 统一归一化到内部 timeframe（例如 1H -> 1h），并据此映射出 OKX bar。
@@ -723,6 +725,7 @@ class OptimizedDeepSeekAnalyzer:
         results: Dict[str, Dict] = {}
         pending: List[Tuple[str, List[List], Dict, float]] = []
         threshold = float(getattr(self.config, "min_signal_quality", 0.5) or 0.5)
+        use_contextual_decision = isinstance(portfolio_context, dict) and bool(portfolio_context)
 
         for inst in norm_ids:
             try:
@@ -738,7 +741,7 @@ class OptimizedDeepSeekAnalyzer:
                 }
                 continue
 
-            if not force_analysis:
+            if not force_analysis and not use_contextual_decision:
                 cached = self.cache.get(inst, tf_for_cache, indicators)
                 if cached:
                     cached["source"] = "cache"
@@ -795,7 +798,7 @@ class OptimizedDeepSeekAnalyzer:
                 "budget": self._get_budget_state(),
             }
 
-        prompt = self._build_batch_prompt(tf_for_cache, pending)
+        prompt = self._build_batch_prompt(tf_for_cache, pending, portfolio_context=portfolio_context)
         max_tokens = min(1200, int(getattr(self.config, "max_output_tokens", 200) or 200) * max(1, len(pending)))
         content, usage = self._call_deepseek_api_ex(prompt, max_tokens=max_tokens)
 
@@ -843,6 +846,9 @@ class OptimizedDeepSeekAnalyzer:
                     "raw_analysis": content,
                     "recommendation": "HOLD",
                     "confidence": 0,
+                    "buy_amount_usdt": 0.0,
+                    "sell_ratio": 0.0,
+                    "sell_amount_usdt": 0.0,
                     "target_price": None,
                     "stop_loss": None,
                     "source": "api_parse_miss",
@@ -854,6 +860,9 @@ class OptimizedDeepSeekAnalyzer:
                     "raw_analysis": item.get("raw_analysis") or content,
                     "recommendation": (item.get("recommendation") or item.get("action") or "HOLD").upper(),
                     "confidence": self._coerce_confidence(item.get("confidence"), default=0),
+                    "buy_amount_usdt": self._coerce_nonnegative_float(item.get("buy_amount_usdt"), default=0.0),
+                    "sell_ratio": self._coerce_ratio(item.get("sell_ratio"), default=0.0),
+                    "sell_amount_usdt": self._coerce_nonnegative_float(item.get("sell_amount_usdt"), default=0.0),
                     "target_price": item.get("target_price"),
                     "stop_loss": item.get("stop_loss"),
                     "source": "api",
@@ -868,7 +877,7 @@ class OptimizedDeepSeekAnalyzer:
             out["indicators"] = indicators
             out["ohlcv_points"] = len(ohlcv)
 
-            if out.get("status") == "success":
+            if out.get("status") == "success" and not use_contextual_decision:
                 self.cache.set(inst, tf_for_cache, indicators, dict(out))
             results[inst] = out
 
@@ -879,7 +888,14 @@ class OptimizedDeepSeekAnalyzer:
 
         if fallback_enabled:
             for inst, ohlcv, indicators in fallback_candidates[:fallback_limit]:
-                single = self._analyze_single_with_existing_data(inst, tf_for_cache, ohlcv, indicators, cache_result=True)
+                single = self._analyze_single_with_existing_data(
+                    inst,
+                    tf_for_cache,
+                    ohlcv,
+                    indicators,
+                    cache_result=not use_contextual_decision,
+                    portfolio_context=portfolio_context,
+                )
                 single["source"] = f"{single.get('source') or 'api'}_fallback_single"
                 single["fallback_reason"] = "batch_parse_miss"
                 single["market_source"] = "okx"
@@ -1112,24 +1128,86 @@ class OptimizedDeepSeekAnalyzer:
             "budget": self._get_budget_state(),
         }
 
-    def _build_batch_prompt(self, timeframe: str, items: List[Tuple[str, List[List], Dict, float]]) -> str:
+    @staticmethod
+    def _build_portfolio_context_lines(portfolio_context: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(portfolio_context, dict) or not portfolio_context:
+            return []
+
+        lines = ["portfolio:"]
+        total_equity = float(portfolio_context.get("total_equity_usdt") or 0.0)
+        available_usdt = float(portfolio_context.get("available_usdt") or 0.0)
+        invested_usdt = float(portfolio_context.get("invested_usdt") or 0.0)
+        exposure_ratio = float(portfolio_context.get("exposure_ratio") or 0.0)
+        cash_reserve_ratio = float(portfolio_context.get("cash_reserve_ratio") or 0.0)
+        max_total_exposure_ratio = float(portfolio_context.get("max_total_exposure_ratio") or 0.0)
+        max_single_asset_weight = float(portfolio_context.get("max_single_asset_weight") or 0.0)
+        max_order_cash_ratio = float(portfolio_context.get("max_order_cash_ratio") or 0.0)
+        min_cash_reserve_ratio = float(portfolio_context.get("min_cash_reserve_ratio") or 0.0)
+
+        lines.append(
+            "- summary: "
+            f"total_equity_usdt={total_equity:.4f}, available_usdt={available_usdt:.4f}, invested_usdt={invested_usdt:.4f}, "
+            f"exposure_ratio={exposure_ratio:.4f}, cash_reserve_ratio={cash_reserve_ratio:.4f}"
+        )
+        lines.append(
+            "- hard_limits: "
+            f"max_total_exposure_ratio={max_total_exposure_ratio:.4f}, max_single_asset_weight={max_single_asset_weight:.4f}, "
+            f"max_order_cash_ratio={max_order_cash_ratio:.4f}, min_cash_reserve_ratio={min_cash_reserve_ratio:.4f}"
+        )
+
+        holdings = portfolio_context.get("holdings") or []
+        if isinstance(holdings, list) and holdings:
+            lines.append("- holdings:")
+            for item in holdings[:8]:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    "  - "
+                    f"{item.get('inst_id')}: base_size={float(item.get('base_size') or 0.0):.8f}, "
+                    f"price={float(item.get('price') or 0.0):.4f}, market_value_usdt={float(item.get('market_value_usdt') or 0.0):.4f}, "
+                    f"weight={float(item.get('weight') or 0.0):.4f}"
+                )
+        else:
+            lines.append("- holdings: none")
+        return lines
+
+    def _build_batch_prompt(
+        self,
+        timeframe: str,
+        items: List[Tuple[str, List[List], Dict, float]],
+        portfolio_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         example_key = str(items[0][0]) if items else "BTC-USDT"
+        holdings_map = ((portfolio_context or {}).get("holdings_by_inst") or {}) if isinstance(portfolio_context, dict) else {}
         lines = [
             "你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。",
             "JSON 格式如下：",
-            f'{{"{example_key}": {{"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "target_price": number|null, "stop_loss": number|null, "reason": string}}}}',
+            f'{{"{example_key}": {{"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "buy_amount_usdt": number, "sell_ratio": 0-1, "sell_amount_usdt": number, "target_price": number|null, "stop_loss": number|null, "reason": string}}}}',
             "",
             "强约束：confidence 必须是 0-100 的整数，不能把 50 当默认值（除非你判断确实完全中性）。",
             "必须覆盖 data 中列出的每一个标的，不能遗漏，也不能把多个标的合并成一个 key。",
             "输出 key 必须与 data 行首冒号前的标识完全一致（例如输入是 BTC-USDT，就输出 BTC-USDT；不要改成 BTCUSDT）。",
+            "如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0。",
+            "如果 recommendation=SELL，buy_amount_usdt=0，并给出 sell_ratio（0-1 之间）或 sell_amount_usdt（>0）；两者都给也可以。",
+            "如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0。",
+            "请结合 portfolio 中的当前资金、持仓和风控上限来决定买多少/卖多少；程序还会做二次风控裁剪。",
             "",
             f"timeframe: {timeframe}",
-            "data:",
         ]
+        lines.extend(self._build_portfolio_context_lines(portfolio_context))
+        lines.append("data:")
         for sym, ohlcv, indicators, q in items:
             close_price = float(ohlcv[-1][4]) if ohlcv else 0.0
+            holding = holdings_map.get(sym) if isinstance(holdings_map, dict) else None
+            holding_desc = "holding=none"
+            if isinstance(holding, dict) and holding:
+                holding_desc = (
+                    f"holding_base={float(holding.get('base_size') or 0.0):.8f}, "
+                    f"holding_value_usdt={float(holding.get('market_value_usdt') or 0.0):.4f}, "
+                    f"holding_weight={float(holding.get('weight') or 0.0):.4f}"
+                )
             lines.append(
-                f"- {sym}: price={close_price:.4f}, ema9={indicators.get('ema_9', 0):.4f}, ema20={indicators.get('ema_20', 0):.4f}, ema50={indicators.get('ema_50', 0):.4f}, rsi14={indicators.get('rsi_14', 0):.2f}, macd={indicators.get('macd', 0):.4f}, signal_quality={q:.2f}"
+                f"- {sym}: price={close_price:.4f}, ema9={indicators.get('ema_9', 0):.4f}, ema20={indicators.get('ema_20', 0):.4f}, ema50={indicators.get('ema_50', 0):.4f}, rsi14={indicators.get('rsi_14', 0):.2f}, macd={indicators.get('macd', 0):.4f}, signal_quality={q:.2f}, {holding_desc}"
             )
         lines.append("\n只输出 JSON。")
         return "\n".join(lines)
@@ -1195,7 +1273,21 @@ class OptimizedDeepSeekAnalyzer:
         if not isinstance(item, dict):
             return False
         keys = {str(k).lower() for k in item.keys()}
-        return bool(keys & {"recommendation", "action", "confidence", "target_price", "stop_loss", "reason", "status"})
+        return bool(
+            keys
+            & {
+                "recommendation",
+                "action",
+                "confidence",
+                "buy_amount_usdt",
+                "sell_ratio",
+                "sell_amount_usdt",
+                "target_price",
+                "stop_loss",
+                "reason",
+                "status",
+            }
+        )
 
     @staticmethod
     def _extract_symbol_hint(item: Dict[str, Any]) -> Optional[str]:
@@ -1302,10 +1394,11 @@ class OptimizedDeepSeekAnalyzer:
         indicators: Dict,
         *,
         cache_result: bool = True,
+        portfolio_context: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         budget_state = self._get_budget_state()
         try:
-            prompt = self._build_optimized_prompt(symbol, timeframe, ohlcv_data, indicators)
+            prompt = self._build_optimized_prompt(symbol, timeframe, ohlcv_data, indicators, portfolio_context=portfolio_context)
             response, usage = self._call_deepseek_api_ex(prompt, max_tokens=int(self.config.max_output_tokens))
             if not response:
                 return {
@@ -1477,8 +1570,14 @@ class OptimizedDeepSeekAnalyzer:
         
         return min(quality, 1.0)
     
-    def _build_optimized_prompt(self, symbol: str, timeframe: str, 
-                               ohlcv_data: List[List], indicators: Dict) -> str:
+    def _build_optimized_prompt(
+        self,
+        symbol: str,
+        timeframe: str,
+        ohlcv_data: List[List],
+        indicators: Dict,
+        portfolio_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """构建优化提示词（减少 token 使用）。
 
         关键点：**强制要求 JSON 输出**，避免解析失败后触发“看起来像写死的默认值”。
@@ -1488,22 +1587,24 @@ class OptimizedDeepSeekAnalyzer:
 
         latest = ohlcv_data[-1]
         close_price = float(latest[4])
-
-        prompt = f"""你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。
-JSON 格式：{{"recommendation":"BUY|SELL|HOLD","confidence":0-100,"target_price":number|null,"stop_loss":number|null,"reason":string}}
-
-symbol: {symbol}
-timeframe: {timeframe}
-price: {close_price:.4f}
-ema9: {float(indicators.get('ema_9', 0)):.4f}
-ema20: {float(indicators.get('ema_20', 0)):.4f}
-ema50: {float(indicators.get('ema_50', 0)):.4f}
-rsi14: {float(indicators.get('rsi_14', 0)):.2f}
-macd: {float(indicators.get('macd', 0)):.4f}
-
-只输出 JSON。"""
-
-        return prompt
+        lines = [
+            "你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。",
+            "JSON 格式：{\"recommendation\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"buy_amount_usdt\":number,\"sell_ratio\":0-1,\"sell_amount_usdt\":number,\"target_price\":number|null,\"stop_loss\":number|null,\"reason\":string}",
+            "如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0。",
+            "如果 recommendation=SELL，buy_amount_usdt=0，并给出 sell_ratio（0-1 之间）或 sell_amount_usdt（>0）。",
+            "如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0。",
+            f"symbol: {symbol}",
+            f"timeframe: {timeframe}",
+            f"price: {close_price:.4f}",
+            f"ema9: {float(indicators.get('ema_9', 0)):.4f}",
+            f"ema20: {float(indicators.get('ema_20', 0)):.4f}",
+            f"ema50: {float(indicators.get('ema_50', 0)):.4f}",
+            f"rsi14: {float(indicators.get('rsi_14', 0)):.2f}",
+            f"macd: {float(indicators.get('macd', 0)):.4f}",
+        ]
+        lines.extend(self._build_portfolio_context_lines(portfolio_context))
+        lines.append("只输出 JSON。")
+        return "\n".join(lines)
     
     def _post_chat_completions(self, payload: Dict, timeout: int = 30) -> Optional[Dict]:
         """调用 chat/completions，并返回原始 JSON（包含 usage 时可用于更准的成本统计）。"""
@@ -1608,6 +1709,28 @@ macd: {float(indicators.get('macd', 0)):.4f}
             return int(default)
         return max(0, min(100, c))
 
+    @staticmethod
+    def _coerce_nonnegative_float(v: Any, default: float = 0.0) -> float:
+        if v is None:
+            return float(default)
+        try:
+            value = float(v)
+        except Exception:
+            return float(default)
+        if value < 0:
+            return float(default)
+        return float(value)
+
+    @staticmethod
+    def _coerce_ratio(v: Any, default: float = 0.0) -> float:
+        if v is None:
+            return float(default)
+        try:
+            value = float(v)
+        except Exception:
+            return float(default)
+        return max(0.0, min(1.0, value))
+
     def _parse_analysis_response(self, response_text: str) -> Dict:
         """解析响应。
 
@@ -1619,6 +1742,9 @@ macd: {float(indicators.get('macd', 0)):.4f}
             "raw_analysis": text,
             "recommendation": "HOLD",
             "confidence": 0,
+            "buy_amount_usdt": 0.0,
+            "sell_ratio": 0.0,
+            "sell_amount_usdt": 0.0,
             "target_price": None,
             "stop_loss": None,
         }
@@ -1639,6 +1765,9 @@ macd: {float(indicators.get('macd', 0)):.4f}
                     rec = (obj.get("recommendation") or obj.get("action") or "HOLD")
                     result["recommendation"] = str(rec).upper()
                     result["confidence"] = self._coerce_confidence(obj.get("confidence"), default=0)
+                    result["buy_amount_usdt"] = self._coerce_nonnegative_float(obj.get("buy_amount_usdt"), default=0.0)
+                    result["sell_ratio"] = self._coerce_ratio(obj.get("sell_ratio"), default=0.0)
+                    result["sell_amount_usdt"] = self._coerce_nonnegative_float(obj.get("sell_amount_usdt"), default=0.0)
                     result["target_price"] = obj.get("target_price")
                     result["stop_loss"] = obj.get("stop_loss")
                     if obj.get("reason") is not None:

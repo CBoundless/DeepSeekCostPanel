@@ -174,18 +174,20 @@ def _build_okx_client() -> OKXClient:
 def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnalyzer, okx: OKXClient) -> None:
     cfg = load_trade_config_from_env()
     budget = analyzer.config.daily_budget
-    max_positions_label = "不限" if cfg.max_positions <= 0 else cfg.max_positions
     logger.info(
-        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s max_positions=%s dynamic_enabled=%s market_quality_threshold=%s dynamic_factor=[%s,%s] order_check_retries=%s order_check_interval_ms=%s simulated=%s",
+        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s dynamic_enabled=%s market_quality_threshold=%s dynamic_factor=[%s,%s] risk_limits(total_exposure=%s single_asset=%s order_cash=%s cash_reserve=%s) order_check_retries=%s order_check_interval_ms=%s simulated=%s",
         cfg.inst_ids,
         cfg.bar,
         cfg.loop_seconds,
         cfg.trade_quote,
-        max_positions_label,
         cfg.dynamic_position_enabled,
         cfg.market_quality_threshold,
         cfg.dynamic_min_factor,
         cfg.dynamic_max_factor,
+        cfg.max_total_exposure_ratio,
+        cfg.max_single_asset_weight,
+        cfg.max_order_cash_ratio,
+        cfg.min_cash_reserve_ratio,
         cfg.order_check_retries,
         cfg.order_check_interval_ms,
         okx.simulated_trading,
@@ -217,6 +219,14 @@ def _validate_config(logger: logging.Logger) -> tuple[OptimizedDeepSeekAnalyzer,
         raise RuntimeError("OKX_TRADE_QUOTE 必须大于 0")
     if cfg.loop_seconds <= 0:
         raise RuntimeError("OKX_LOOP_SECONDS 必须大于 0")
+    for name, value in {
+        "OKX_MAX_TOTAL_EXPOSURE_RATIO": cfg.max_total_exposure_ratio,
+        "OKX_MAX_SINGLE_ASSET_WEIGHT": cfg.max_single_asset_weight,
+        "OKX_MAX_ORDER_CASH_RATIO": cfg.max_order_cash_ratio,
+        "OKX_MIN_CASH_RESERVE_RATIO": cfg.min_cash_reserve_ratio,
+    }.items():
+        if value < 0 or value > 1:
+            raise RuntimeError(f"{name} 必须在 0 到 1 之间")
 
     _log_runtime_summary(logger, analyzer, okx)
     return analyzer, okx

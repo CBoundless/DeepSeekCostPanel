@@ -14,13 +14,17 @@ Env vars:
 - OKX_TD_MODE: default "cash"
 - OKX_BAR: default "1H" (OKX bar)
 - OKX_LIMIT: default 200
-- OKX_TRADE_QUOTE: default 15 (USDT) - market buy uses quote amount when tgtCcy=quote_ccy
+- OKX_TRADE_QUOTE: default 15 (USDT) - 作为 AI 未给金额时的基础回退金额
 - OKX_SPOT_TGT_CCY: default "quote_ccy" (for market buy sizing)
 - OKX_CONF_THRESHOLD: default 65
 - OKX_LOOP_SECONDS: default 60
-- OKX_MAX_POSITIONS: default 2 (最多同时持有几个币；设为 0 表示不限)
 - OKX_ORDER_CHECK_RETRIES: default 5 (下单后最多轮询几次订单状态)
 - OKX_ORDER_CHECK_INTERVAL_MS: default 1000 (每次轮询间隔毫秒)
+- OKX_MAX_TOTAL_EXPOSURE_RATIO: default 0.70 (组合总仓位上限)
+- OKX_MAX_SINGLE_ASSET_WEIGHT: default 0.35 (单币仓位上限)
+- OKX_MAX_ORDER_CASH_RATIO: default 0.20 (单次下单最多占可用现金比例)
+- OKX_MIN_CASH_RESERVE_RATIO: default 0.10 (最少保留现金比例)
+- OKX_SYNC_POSITIONS_ON_START: default 1 (启动时从交易所同步真实持仓)
 
 Dynamic position (持仓管理):
 - OKX_STOP_LOSS_PCT: default 0.02 (2%)
@@ -103,11 +107,10 @@ class TradeConfig:
     spot_tgt_ccy: str = "quote_ccy"
     conf_threshold: int = 65
     loop_seconds: int = 60
-    max_positions: int = 2
     order_check_retries: int = 5
     order_check_interval_ms: int = 1000
 
-    # dynamic position management
+    # dynamic position management / AI sizing fallback
     stop_loss_pct: float = 0.02
     trailing_stop_pct: float = 0.01
     trailing_activate_pct: float = 0.005
@@ -116,6 +119,11 @@ class TradeConfig:
     market_quality_threshold: float = 0.58
     dynamic_min_factor: float = 0.7
     dynamic_max_factor: float = 1.5
+    max_total_exposure_ratio: float = 0.70
+    max_single_asset_weight: float = 0.35
+    max_order_cash_ratio: float = 0.20
+    min_cash_reserve_ratio: float = 0.10
+    sync_positions_on_start: bool = True
     decision_history_limit: int = 300
 
 
@@ -448,6 +456,230 @@ class AutoTrader:
             )
         return "; ".join(parts)
 
+    def _get_account_balance_payload(self) -> Optional[Dict[str, Any]]:
+        payload = self.okx.get_balance()
+        if not isinstance(payload, dict) or str(payload.get("code")) != "0":
+            self.log(f"⚠️ 账户余额查询失败 payload={payload}")
+            return None
+        return payload
+
+    def _get_account_balance_details(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        data_payload = payload if isinstance(payload, dict) else self._get_account_balance_payload()
+        if not isinstance(data_payload, dict):
+            return []
+        try:
+            data = data_payload.get("data") or []
+            if data and isinstance(data, list):
+                details = (data[0] or {}).get("details") or []
+                return [x for x in details if isinstance(x, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _build_portfolio_snapshot(self) -> Optional[Dict[str, Any]]:
+        payload = self._get_account_balance_payload()
+        details = self._get_account_balance_details(payload)
+        if not details:
+            return None
+
+        detail_map: Dict[str, Dict[str, Any]] = {}
+        for item in details:
+            ccy = str(item.get("ccy") or "").upper()
+            if ccy:
+                detail_map[ccy] = item
+
+        usdt_detail = detail_map.get("USDT") or {}
+        available_usdt = max(
+            0.0,
+            float(
+                self._to_float(usdt_detail.get("availBal"))
+                or self._to_float(usdt_detail.get("cashBal"))
+                or self._to_float(usdt_detail.get("eq"))
+                or 0.0
+            ),
+        )
+
+        total_equity_usdt = 0.0
+        data0 = ((payload or {}).get("data") or [None])[0] or {}
+        for key in ("totalEq", "adjEq", "isoEq"):
+            try:
+                total_equity_usdt = max(total_equity_usdt, float(self._to_float(data0.get(key)) or 0.0))
+            except Exception:
+                continue
+
+        if total_equity_usdt <= 0:
+            total_equity_usdt = sum(max(0.0, float(self._to_float(item.get("eqUsd")) or 0.0)) for item in details)
+
+        holdings: List[Dict[str, Any]] = []
+        holdings_by_inst: Dict[str, Dict[str, Any]] = {}
+        tracked_value_usdt = 0.0
+
+        for inst_id in self.cfg.inst_ids:
+            base_ccy = inst_id.split("-", 1)[0].upper() if "-" in inst_id else inst_id.upper()
+            detail = detail_map.get(base_ccy) or {}
+            base_size = max(
+                0.0,
+                float(
+                    self._to_float(detail.get("availBal"))
+                    or self._to_float(detail.get("cashBal"))
+                    or self._to_float(detail.get("eq"))
+                    or 0.0
+                ),
+            )
+            if base_size <= 0:
+                continue
+
+            pos = self._pos.get(inst_id) or PositionState()
+            price = float(pos.last_price or 0.0)
+            if price <= 0:
+                price = float(self._get_last_price(inst_id) or 0.0)
+            market_value_usdt = float(self._to_float(detail.get("eqUsd")) or 0.0)
+            if market_value_usdt <= 0 and price > 0:
+                market_value_usdt = float(base_size) * float(price)
+            tracked_value_usdt += max(0.0, market_value_usdt)
+            holding = {
+                "inst_id": inst_id,
+                "base_ccy": base_ccy,
+                "base_size": float(base_size),
+                "price": float(price),
+                "market_value_usdt": max(0.0, float(market_value_usdt)),
+                "weight": 0.0,
+            }
+            holdings.append(holding)
+            holdings_by_inst[inst_id] = holding
+
+        if total_equity_usdt <= 0:
+            total_equity_usdt = max(available_usdt + tracked_value_usdt, available_usdt)
+
+        invested_usdt = max(tracked_value_usdt, max(0.0, total_equity_usdt - available_usdt))
+        exposure_ratio = (invested_usdt / total_equity_usdt) if total_equity_usdt > 0 else 0.0
+        cash_reserve_ratio = (available_usdt / total_equity_usdt) if total_equity_usdt > 0 else 0.0
+
+        if total_equity_usdt > 0:
+            for holding in holdings:
+                holding["weight"] = max(0.0, float(holding.get("market_value_usdt") or 0.0) / total_equity_usdt)
+
+        holdings.sort(key=lambda item: float(item.get("market_value_usdt") or 0.0), reverse=True)
+        return {
+            "total_equity_usdt": float(total_equity_usdt),
+            "available_usdt": float(available_usdt),
+            "invested_usdt": float(invested_usdt),
+            "exposure_ratio": float(exposure_ratio),
+            "cash_reserve_ratio": float(cash_reserve_ratio),
+            "max_total_exposure_ratio": float(self.cfg.max_total_exposure_ratio),
+            "max_single_asset_weight": float(self.cfg.max_single_asset_weight),
+            "max_order_cash_ratio": float(self.cfg.max_order_cash_ratio),
+            "min_cash_reserve_ratio": float(self.cfg.min_cash_reserve_ratio),
+            "holdings": holdings,
+            "holdings_by_inst": holdings_by_inst,
+        }
+
+    def _sync_positions_from_portfolio(self, snapshot: Optional[Dict[str, Any]]) -> int:
+        if not isinstance(snapshot, dict):
+            return 0
+        holdings_by_inst = snapshot.get("holdings_by_inst") or {}
+        changed = 0
+        for inst in self.cfg.inst_ids:
+            pos = self._pos.get(inst) or PositionState()
+            self._pos[inst] = pos
+            holding = holdings_by_inst.get(inst) if isinstance(holdings_by_inst, dict) else None
+            if isinstance(holding, dict) and float(holding.get("base_size") or 0.0) > 0:
+                was_holding = bool(pos.holding)
+                pos.holding = True
+                pos.base_size = max(0.0, float(holding.get("base_size") or 0.0))
+                pos.quote_size = max(0.0, float(holding.get("market_value_usdt") or 0.0))
+                px = self._to_float(holding.get("price"))
+                if px is not None and px > 0:
+                    pos.last_price = float(px)
+                    if pos.entry_price is None:
+                        pos.entry_price = float(px)
+                    if pos.peak_price is None:
+                        pos.peak_price = float(px)
+                    else:
+                        pos.peak_price = max(float(pos.peak_price), float(px))
+                if not was_holding:
+                    changed += 1
+            else:
+                if pos.holding or pos.base_size > 0 or pos.quote_size > 0:
+                    self._reset_position(pos)
+                    changed += 1
+        return changed
+
+    def _resolve_requested_buy_quote(self, result: Dict[str, Any], market_quality: float, confidence: int) -> Tuple[float, float, str]:
+        fallback_factor = self._calc_position_factor(market_quality, confidence)
+        fallback_quote = max(0.0, float(self.cfg.trade_quote) * fallback_factor)
+        raw_buy_amount = (result or {}).get("buy_amount_usdt")
+        if raw_buy_amount is None:
+            return fallback_quote, fallback_factor, "fallback_dynamic_quote"
+        buy_amount = self._to_float(raw_buy_amount)
+        if buy_amount is None:
+            return 0.0, fallback_factor, "invalid_ai_buy_amount"
+        buy_amount = max(0.0, float(buy_amount))
+        ai_factor = (buy_amount / float(self.cfg.trade_quote)) if float(self.cfg.trade_quote) > 0 else fallback_factor
+        return buy_amount, ai_factor, "ai_buy_amount"
+
+    def _resolve_sell_request(self, result: Dict[str, Any]) -> Tuple[Optional[float], float, bool]:
+        raw_sell_ratio = (result or {}).get("sell_ratio")
+        raw_sell_amount = (result or {}).get("sell_amount_usdt")
+        has_explicit_sell = raw_sell_ratio is not None or raw_sell_amount is not None
+        sell_ratio = None
+        if raw_sell_ratio is not None:
+            ratio = self._to_float(raw_sell_ratio)
+            if ratio is not None:
+                sell_ratio = self._clamp(float(ratio), 0.0, 1.0)
+        sell_amount_usdt = 0.0
+        if raw_sell_amount is not None:
+            sell_amount_usdt = max(0.0, float(self._to_float(raw_sell_amount) or 0.0))
+        return sell_ratio, sell_amount_usdt, has_explicit_sell
+
+    def _calc_buy_quote_after_risk(
+        self,
+        inst_id: str,
+        requested_quote: float,
+        snapshot: Optional[Dict[str, Any]],
+    ) -> Tuple[float, str, Dict[str, float]]:
+        req = max(0.0, float(requested_quote))
+        if req <= 0:
+            return 0.0, "non_positive_request", {"requested_quote": req}
+        if not isinstance(snapshot, dict):
+            return req, "no_portfolio_snapshot", {"requested_quote": req, "final_quote": req}
+
+        available_usdt = max(0.0, float(snapshot.get("available_usdt") or 0.0))
+        total_equity_usdt = max(0.0, float(snapshot.get("total_equity_usdt") or 0.0))
+        invested_usdt = max(0.0, float(snapshot.get("invested_usdt") or 0.0))
+        holdings_by_inst = snapshot.get("holdings_by_inst") or {}
+        current_holding = holdings_by_inst.get(inst_id) if isinstance(holdings_by_inst, dict) else None
+        current_inst_value = max(0.0, float((current_holding or {}).get("market_value_usdt") or 0.0))
+
+        caps: Dict[str, float] = {
+            "available_balance": max(0.0, available_usdt * 0.98),
+        }
+        caps["max_order_cash_ratio"] = max(0.0, available_usdt * float(self.cfg.max_order_cash_ratio))
+        if total_equity_usdt > 0:
+            caps["cash_reserve"] = max(0.0, available_usdt - total_equity_usdt * float(self.cfg.min_cash_reserve_ratio))
+            caps["portfolio_room"] = max(
+                0.0,
+                total_equity_usdt * float(self.cfg.max_total_exposure_ratio) - invested_usdt,
+            )
+            caps["single_asset_room"] = max(
+                0.0,
+                total_equity_usdt * float(self.cfg.max_single_asset_weight) - current_inst_value,
+            )
+
+        final_quote = min([req] + list(caps.values())) if caps else req
+        final_quote = max(0.0, float(final_quote))
+        meta = {
+            "requested_quote": req,
+            "final_quote": final_quote,
+            "available_usdt": available_usdt,
+            "total_equity_usdt": total_equity_usdt,
+            "invested_usdt": invested_usdt,
+            "current_inst_value": current_inst_value,
+        }
+        meta.update({k: float(v) for k, v in caps.items()})
+        reason = "ok" if final_quote > 0 else "risk_blocked"
+        return final_quote, reason, meta
+
     def _verify_order_state(
         self,
         inst_id: str,
@@ -511,9 +743,10 @@ class AutoTrader:
         self.log(f"🟡 自动交易启动（OKX {mode_label}）")
         self.log(
             f"instIds={self.cfg.inst_ids} bar={self.cfg.bar} loop={self.cfg.loop_seconds}s conf>={self.cfg.conf_threshold} "
-            f"trade_quote={self.cfg.trade_quote} max_positions={self.cfg.max_positions} "
-            f"dynamic_position_enabled={self.cfg.dynamic_position_enabled} market_quality_threshold={self.cfg.market_quality_threshold} "
-            f"dynamic_factor=[{self.cfg.dynamic_min_factor},{self.cfg.dynamic_max_factor}] "
+            f"base_trade_quote={self.cfg.trade_quote} dynamic_position_enabled={self.cfg.dynamic_position_enabled} "
+            f"market_quality_threshold={self.cfg.market_quality_threshold} dynamic_factor=[{self.cfg.dynamic_min_factor},{self.cfg.dynamic_max_factor}] "
+            f"risk_limits(total_exposure={self.cfg.max_total_exposure_ratio}, single_asset={self.cfg.max_single_asset_weight}, "
+            f"order_cash={self.cfg.max_order_cash_ratio}, cash_reserve={self.cfg.min_cash_reserve_ratio}) "
             f"order_check_retries={self.cfg.order_check_retries} order_check_interval_ms={self.cfg.order_check_interval_ms} "
             f"stop_loss={self.cfg.stop_loss_pct} trailing_stop={self.cfg.trailing_stop_pct} "
             f"trailing_activate={self.cfg.trailing_activate_pct} exit_on_ai_sell={self.cfg.exit_on_ai_sell}"
@@ -525,6 +758,17 @@ class AutoTrader:
         except Exception as e:
             self.log(f"❌ 无法启动：{e}")
             return
+
+        if bool(self.cfg.sync_positions_on_start):
+            snapshot = self._build_portfolio_snapshot()
+            changed = self._sync_positions_from_portfolio(snapshot)
+            if isinstance(snapshot, dict):
+                self.log(
+                    f"🔁 启动同步持仓完成 changed={changed} total_equity={float(snapshot.get('total_equity_usdt') or 0.0):.4f} "
+                    f"available_usdt={float(snapshot.get('available_usdt') or 0.0):.4f} holdings={len(snapshot.get('holdings') or [])}"
+                )
+            else:
+                self.log("⚠️ 启动时未获取到组合快照，将在后续轮次继续尝试同步")
 
         while not self._stop.is_set():
             try:
@@ -541,6 +785,44 @@ class AutoTrader:
         self.log("🟠 自动交易已停止")
 
     def _tick_once(self):
+        def _fmt_meta(rr: dict) -> str:
+            src = rr.get("source")
+            tks = rr.get("tokens")
+            cst = rr.get("cost")
+            parts = []
+            if src:
+                parts.append(f"source={src}")
+            if tks is not None:
+                parts.append(f"tokens={tks}")
+            if cst is not None:
+                parts.append(f"cost=${cst}")
+            return (" " + " ".join(parts)) if parts else ""
+
+        # 先统一刷新价格，保证组合快照、止损和日志使用同一轮价格
+        for inst in self.cfg.inst_ids:
+            pos = self._pos.get(inst) or PositionState()
+            self._pos[inst] = pos
+            px = self._get_last_price(inst)
+            if px is not None:
+                pos.last_price = px
+                if pos.holding:
+                    if pos.peak_price is None:
+                        pos.peak_price = px
+                    else:
+                        pos.peak_price = max(float(pos.peak_price), float(px))
+
+        portfolio_snapshot = self._build_portfolio_snapshot()
+        if isinstance(portfolio_snapshot, dict):
+            self._sync_positions_from_portfolio(portfolio_snapshot)
+            self.log(
+                f"💼 组合快照 total_equity={float(portfolio_snapshot.get('total_equity_usdt') or 0.0):.4f} "
+                f"available_usdt={float(portfolio_snapshot.get('available_usdt') or 0.0):.4f} "
+                f"invested_usdt={float(portfolio_snapshot.get('invested_usdt') or 0.0):.4f} "
+                f"exposure={float(portfolio_snapshot.get('exposure_ratio') or 0.0):.2%} holdings={len(portfolio_snapshot.get('holdings') or [])}"
+            )
+        else:
+            self.log("⚠️ 本轮未获取到组合快照，AI 将只基于行情做判断，程序仍会在下单前做余额限制")
+
         # Use batch analysis to reduce DeepSeek calls
         batch = self.analyzer.analyze_markets_from_okx(
             inst_ids=self.cfg.inst_ids,
@@ -548,6 +830,7 @@ class AutoTrader:
             bar=self.cfg.bar,
             limit=int(self.cfg.limit),
             force_analysis=False,
+            portfolio_context=portfolio_snapshot,
         )
         results = (batch or {}).get("results") or {}
 
@@ -570,33 +853,7 @@ class AutoTrader:
         except Exception:
             pass
 
-        def _fmt_meta(rr: dict) -> str:
-            src = rr.get("source")
-            tks = rr.get("tokens")
-            cst = rr.get("cost")
-            parts = []
-            if src:
-                parts.append(f"source={src}")
-            if tks is not None:
-                parts.append(f"tokens={tks}")
-            if cst is not None:
-                parts.append(f"cost=${cst}")
-            return (" " + " ".join(parts)) if parts else ""
-
-        # 先统一刷新价格，保证后面的止损/持仓日志使用同一轮价格
-        for inst in self.cfg.inst_ids:
-            pos = self._pos.get(inst) or PositionState()
-            self._pos[inst] = pos
-            px = self._get_last_price(inst)
-            if px is not None:
-                pos.last_price = px
-                if pos.holding:
-                    if pos.peak_price is None:
-                        pos.peak_price = px
-                    else:
-                        pos.peak_price = max(float(pos.peak_price), float(px))
-
-        buy_candidates: List[Tuple[str, float, int, float, float, float, dict]] = []
+        buy_candidates: List[Tuple[str, float, int, float, float, float, dict, str]] = []
         frequency_limit_skips: List[str] = []
 
         for inst in self.cfg.inst_ids:
@@ -627,6 +884,8 @@ class AutoTrader:
                 if pos.holding and self._should_force_exit_by_risk(inst, pos):
                     ok, _close_info = self._close_long_spot(inst)
                     if ok:
+                        portfolio_snapshot = self._build_portfolio_snapshot() or portfolio_snapshot
+                        self._sync_positions_from_portfolio(portfolio_snapshot)
                         self._append_decision(
                             inst_id=inst,
                             action="SELL",
@@ -635,7 +894,6 @@ class AutoTrader:
                             signal_quality=signal_quality,
                             market_quality=market_quality,
                         )
-                        self._reset_position(pos)
                 else:
                     self._append_decision(
                         inst_id=inst,
@@ -649,8 +907,6 @@ class AutoTrader:
                         frequency_limit_skips.append(inst)
                     else:
                         self.log(f"[{inst}] skip status={r.get('status')} {reason}{_fmt_meta(r)}")
-
-                        # 解析失败时，把 raw_analysis 也打出来（截断），方便定位 key/格式问题
                         raw = r.get("raw_analysis")
                         if raw:
                             try:
@@ -665,6 +921,8 @@ class AutoTrader:
             if pos.holding and self._should_force_exit_by_risk(inst, pos):
                 ok, _close_info = self._close_long_spot(inst)
                 if ok:
+                    portfolio_snapshot = self._build_portfolio_snapshot() or portfolio_snapshot
+                    self._sync_positions_from_portfolio(portfolio_snapshot)
                     self._append_decision(
                         inst_id=inst,
                         action="SELL",
@@ -673,10 +931,9 @@ class AutoTrader:
                         signal_quality=signal_quality,
                         market_quality=market_quality,
                     )
-                    self._reset_position(pos)
                 continue
 
-            # AI 置信度不足：不新开仓；持仓则继续持有
+            # AI 置信度不足：不加仓；持仓则继续持有
             if conf < int(self.cfg.conf_threshold):
                 self._append_decision(
                     inst_id=inst,
@@ -693,22 +950,53 @@ class AutoTrader:
                 continue
 
             if rec == "SELL" and pos.holding and bool(self.cfg.exit_on_ai_sell):
-                ok, _close_info = self._close_long_spot(inst)
-                if ok:
+                sell_ratio, sell_amount_usdt, has_explicit_sell = self._resolve_sell_request(r)
+                if has_explicit_sell and sell_ratio is None and sell_amount_usdt <= 0:
                     self._append_decision(
                         inst_id=inst,
-                        action="SELL",
-                        reason="ai_sell_signal",
+                        action="SKIP",
+                        reason="invalid_ai_sell_amount",
                         confidence=conf,
                         signal_quality=signal_quality,
                         market_quality=market_quality,
                     )
-                    self._reset_position(pos)
+                    self._log_position(inst, pos, note=f"SELL(conf={conf}) 但 AI 卖出数量无效{_fmt_meta(r)}")
+                    continue
+
+                sell_ratio_to_use = sell_ratio
+                if sell_ratio_to_use is None and sell_amount_usdt <= 0:
+                    sell_ratio_to_use = 1.0
+
+                ok, _close_info = self._close_long_spot(
+                    inst,
+                    sell_ratio=sell_ratio_to_use,
+                    sell_quote_usdt=sell_amount_usdt,
+                )
+                if ok:
+                    portfolio_snapshot = self._build_portfolio_snapshot() or portfolio_snapshot
+                    self._sync_positions_from_portfolio(portfolio_snapshot)
+                    pos = self._pos.get(inst) or PositionState()
+                    action = "SELL" if not pos.holding else "SELL_PARTIAL"
+                    reason = "ai_sell_signal"
+                    if sell_ratio_to_use is not None:
+                        reason += f":ratio={sell_ratio_to_use:.4f}"
+                    elif sell_amount_usdt > 0:
+                        reason += f":quote={sell_amount_usdt:.4f}"
+                    self._append_decision(
+                        inst_id=inst,
+                        action=action,
+                        reason=reason,
+                        confidence=conf,
+                        signal_quality=signal_quality,
+                        market_quality=market_quality,
+                    )
+                    if pos.holding:
+                        self._log_position(inst, pos, note=f"部分 SELL 后继续持有 market_q={market_quality:.2f}{_fmt_meta(r)}")
                 else:
                     self._log_position(inst, pos, note=f"SELL(conf={conf}) 信号但平仓失败 market_q={market_quality:.2f}{_fmt_meta(r)}")
                 continue
 
-            if rec == "BUY" and not pos.holding:
+            if rec == "BUY":
                 if market_quality < float(self.cfg.market_quality_threshold):
                     self._append_decision(
                         inst_id=inst,
@@ -724,22 +1012,32 @@ class AutoTrader:
                     )
                     continue
 
-                position_factor = self._calc_position_factor(market_quality, conf)
-                planned_quote = max(0.0, float(self.cfg.trade_quote) * position_factor)
-                buy_candidates.append((inst, market_quality, conf, planned_quote, position_factor, signal_quality, r))
+                requested_quote, position_factor, quote_source = self._resolve_requested_buy_quote(r, market_quality, conf)
+                if requested_quote <= 0:
+                    self._append_decision(
+                        inst_id=inst,
+                        action="SKIP",
+                        reason=quote_source,
+                        confidence=conf,
+                        signal_quality=signal_quality,
+                        market_quality=market_quality,
+                    )
+                    self.log(f"[{inst}] BUY(conf={conf}) 但买入金额无效 source={quote_source}{_fmt_meta(r)}")
+                    continue
+
+                buy_candidates.append((inst, market_quality, conf, requested_quote, position_factor, signal_quality, r, quote_source))
                 self._append_decision(
                     inst_id=inst,
                     action="BUY_CANDIDATE",
-                    reason="passed_filters",
+                    reason=quote_source,
                     confidence=conf,
                     signal_quality=signal_quality,
                     market_quality=market_quality,
                     position_factor=position_factor,
-                    planned_quote=planned_quote,
+                    planned_quote=requested_quote,
                 )
                 continue
 
-            # 默认：继续持有或观望
             self._append_decision(
                 inst_id=inst,
                 action=rec,
@@ -766,83 +1064,102 @@ class AutoTrader:
             key=lambda item: (-float(item[1][1]), -int(item[1][2]), item[0]),
         )
         summary = ", ".join(
-            f"{inst}:mq={market_quality:.2f}/conf={conf}/quote={planned_quote:.2f}"
-            for _idx, (inst, market_quality, conf, planned_quote, _factor, _signal_quality, _r) in ranked_candidates
+            f"{inst}:mq={market_quality:.2f}/conf={conf}/ai_quote={requested_quote:.2f}/src={quote_source}"
+            for _idx, (inst, market_quality, conf, requested_quote, _factor, _signal_quality, _r, quote_source) in ranked_candidates
         )
         self.log(f"🧠 BUY 候选排序（按市场质量/置信度）：{summary}")
 
-        available_slots = len(ranked_candidates) if int(self.cfg.max_positions) <= 0 else max(0, int(self.cfg.max_positions) - self._holding_count())
-        if available_slots <= 0:
-            for _idx, (inst, market_quality, conf, _planned_quote, _factor, _signal_quality, r) in ranked_candidates:
-                self.log(
-                    f"[{inst}] BUY(conf={conf}) 但已达到最大持仓数 {self.cfg.max_positions} "
-                    f"market_q={market_quality:.2f}{_fmt_meta(r)}"
-                )
-            return
+        for rank, (_idx, (inst, market_quality, conf, requested_quote, position_factor, signal_quality, r, quote_source)) in enumerate(ranked_candidates, start=1):
+            current_snapshot = self._build_portfolio_snapshot() or portfolio_snapshot
+            if isinstance(current_snapshot, dict):
+                portfolio_snapshot = current_snapshot
+                self._sync_positions_from_portfolio(portfolio_snapshot)
 
-        opened = 0
-        for rank, (_idx, (inst, market_quality, conf, planned_quote, position_factor, signal_quality, r)) in enumerate(ranked_candidates, start=1):
-            if opened >= available_slots:
+            final_quote, clamp_reason, clamp_meta = self._calc_buy_quote_after_risk(inst, requested_quote, portfolio_snapshot)
+            if final_quote <= 0:
+                self._append_decision(
+                    inst_id=inst,
+                    action="BUY_BLOCKED",
+                    reason=clamp_reason,
+                    confidence=conf,
+                    signal_quality=signal_quality,
+                    market_quality=market_quality,
+                    position_factor=position_factor,
+                    planned_quote=requested_quote,
+                )
                 self.log(
-                    f"[{inst}] BUY(conf={conf}) 但本轮优先级不足，较高质量标的已占用仓位 "
-                    f"market_q={market_quality:.2f}{_fmt_meta(r)}"
+                    f"[{inst}] BUY(conf={conf}) 被风控拦截 ai_quote={requested_quote:.4f} clamp_reason={clamp_reason} "
+                    f"caps={clamp_meta}{_fmt_meta(r)}"
                 )
                 continue
 
             pos = self._pos.get(inst) or PositionState()
             self._pos[inst] = pos
+            was_holding = bool(pos.holding)
+            old_entry_price = pos.entry_price
+            old_base_size = max(0.0, float(pos.base_size or 0.0))
             ok, open_info = self._open_long_spot(
                 inst,
-                quote=planned_quote,
+                quote=final_quote,
+                requested_quote=requested_quote,
                 market_quality=market_quality,
                 signal_quality=signal_quality,
                 confidence=conf,
                 position_factor=position_factor,
             )
             if ok:
-                opened += 1
+                portfolio_snapshot = self._build_portfolio_snapshot() or portfolio_snapshot
+                self._sync_positions_from_portfolio(portfolio_snapshot)
+                pos = self._pos.get(inst) or pos
+                self._pos[inst] = pos
                 pos.holding = True
                 pos.entry_confidence = conf
                 pos.entry_market_quality = market_quality
                 pos.last_market_quality = market_quality
-                pos.quote_size = self._to_float((open_info or {}).get("requestQuote")) or planned_quote
+                if pos.quote_size <= 0:
+                    pos.quote_size = self._to_float((open_info or {}).get("requestQuote")) or final_quote
                 filled_base = self._to_float((open_info or {}).get("accFillSz")) or self._to_float((open_info or {}).get("fillSz"))
-                if filled_base is not None and filled_base > 0:
-                    pos.base_size = float(filled_base)
                 avg_px = self._to_float((open_info or {}).get("avgPx"))
                 fill_px = self._to_float((open_info or {}).get("fillPx"))
                 entry_px = avg_px or fill_px or pos.last_price
                 if entry_px is not None:
-                    pos.entry_price = float(entry_px)
-                    pos.peak_price = float(entry_px)
+                    if was_holding and old_entry_price is not None and old_base_size > 0 and filled_base is not None and filled_base > 0:
+                        total_base = old_base_size + float(filled_base)
+                        if total_base > 0:
+                            pos.entry_price = ((float(old_entry_price) * old_base_size) + (float(entry_px) * float(filled_base))) / total_base
+                    elif pos.entry_price is None or not was_holding:
+                        pos.entry_price = float(entry_px)
+                    if pos.peak_price is None:
+                        pos.peak_price = float(entry_px)
+                action = "BUY_ADD" if was_holding else "BUY"
                 self._append_decision(
                     inst_id=inst,
-                    action="BUY",
-                    reason=f"rank={rank}",
+                    action=action,
+                    reason=f"rank={rank},{quote_source},{clamp_reason}",
                     confidence=conf,
                     signal_quality=signal_quality,
                     market_quality=market_quality,
                     position_factor=position_factor,
-                    planned_quote=planned_quote,
+                    planned_quote=final_quote,
                 )
                 self._log_position(
                     inst,
                     pos,
                     note=(
-                        f"按质量排名第 {rank} 开仓(conf={conf} market_q={market_quality:.2f} "
-                        f"signal_q={signal_quality:.2f} factor={position_factor:.2f} quote={planned_quote:.2f}){_fmt_meta(r)}"
+                        f"AI建议开仓 rank={rank} conf={conf} market_q={market_quality:.2f} signal_q={signal_quality:.2f} "
+                        f"ai_quote={requested_quote:.2f} final_quote={final_quote:.2f} source={quote_source} clamp={clamp_reason}{_fmt_meta(r)}"
                     ),
                 )
             else:
                 self._append_decision(
                     inst_id=inst,
                     action="BUY_FAILED",
-                    reason=f"rank={rank}",
+                    reason=f"rank={rank},{quote_source},{clamp_reason}",
                     confidence=conf,
                     signal_quality=signal_quality,
                     market_quality=market_quality,
                     position_factor=position_factor,
-                    planned_quote=planned_quote,
+                    planned_quote=final_quote,
                 )
 
     def _open_long_spot(
@@ -850,6 +1167,7 @@ class AutoTrader:
         inst_id: str,
         *,
         quote: float,
+        requested_quote: Optional[float] = None,
         market_quality: float = 0.0,
         signal_quality: float = 0.0,
         confidence: int = 0,
@@ -880,8 +1198,9 @@ class AutoTrader:
             pass
 
         clid = self._build_cl_ord_id("B", inst_id)
+        ai_quote_text = "n/a" if requested_quote is None else f"{float(requested_quote):.4f}"
         self.log(
-            f"[{inst_id}] 🚀 提交 BUY 市价单 quote={effective_quote:.4f} conf={confidence} "
+            f"[{inst_id}] 🚀 提交 BUY 市价单 ai_quote={ai_quote_text} final_quote={effective_quote:.4f} conf={confidence} "
             f"market_q={market_quality:.2f} signal_q={signal_quality:.2f} factor={position_factor:.2f} clOrdId={clid}"
         )
         payload = self.okx.place_order(
@@ -925,15 +1244,20 @@ class AutoTrader:
         out.setdefault("requestQuote", effective_quote)
         return True, out
 
-    def _close_long_spot(self, inst_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        # Sell tracked base asset amount first; only fallback to full available balance if local position size is unknown.
+    def _close_long_spot(
+        self,
+        inst_id: str,
+        *,
+        sell_ratio: Optional[float] = None,
+        sell_quote_usdt: float = 0.0,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        # Sell tracked base asset amount first; fallback to available balance if local position size is unknown.
         base_ccy = inst_id.split("-")[0].upper() if "-" in inst_id else inst_id.upper()
         before_snapshot = self._get_balance_snapshot(inst_id)
         self.log(f"[{inst_id}] 💰 SELL 前余额：{self._format_balance_snapshot(before_snapshot)}")
         bal = self.okx.get_balance(ccy=base_ccy)
 
         avail_base = None
-        # OKX balance response nesting differs across accounts; do best-effort extraction
         try:
             if str(bal.get("code")) == "0":
                 data = bal.get("data") or []
@@ -948,28 +1272,50 @@ class AutoTrader:
             avail_base = None
 
         tracked_base = 0.0
+        tracked_last_price = 0.0
         try:
-            tracked_base = max(0.0, float((self._pos.get(inst_id) or PositionState()).base_size))
+            pos = self._pos.get(inst_id) or PositionState()
+            tracked_base = max(0.0, float(pos.base_size))
+            tracked_last_price = max(0.0, float(pos.last_price or 0.0))
         except Exception:
             tracked_base = 0.0
+            tracked_last_price = 0.0
 
-        sell_size_float = avail_base if avail_base is not None else 0.0
+        sellable_base = avail_base if avail_base is not None else 0.0
         if tracked_base > 0 and avail_base is not None and avail_base > 0:
-            sell_size_float = min(float(avail_base), float(tracked_base))
+            sellable_base = min(float(avail_base), float(tracked_base))
             self.log(
-                f"[{inst_id}] 🧾 优先按机器人记录仓位卖出 tracked={tracked_base:.8f} avail={avail_base:.8f} sell={sell_size_float:.8f}"
+                f"[{inst_id}] 🧾 优先按机器人记录仓位卖出 tracked={tracked_base:.8f} avail={avail_base:.8f} sellable={sellable_base:.8f}"
             )
         elif tracked_base > 0:
-            sell_size_float = tracked_base
+            sellable_base = tracked_base
             self.log(f"[{inst_id}] 🧾 未取到可用余额，按机器人记录仓位卖出 tracked={tracked_base:.8f}")
 
-        if sell_size_float <= 0:
+        if sellable_base <= 0:
             self.log(f"[{inst_id}] ⚠️ 未找到可卖数量（base={base_ccy} tracked={tracked_base} avail={avail_base}），跳过平仓 payload={bal}")
+            return False, None
+
+        sell_size_float = sellable_base
+        sell_reason = "full_exit"
+        if sell_ratio is not None:
+            ratio = self._clamp(float(sell_ratio), 0.0, 1.0)
+            sell_size_float = sellable_base * ratio
+            sell_reason = f"ratio={ratio:.4f}"
+        elif sell_quote_usdt > 0:
+            last_price = tracked_last_price or float(self._get_last_price(inst_id) or 0.0)
+            if last_price > 0:
+                sell_size_float = min(sellable_base, float(sell_quote_usdt) / float(last_price))
+                sell_reason = f"quote={float(sell_quote_usdt):.4f}"
+            else:
+                self.log(f"[{inst_id}] ⚠️ 无法根据 sell_amount_usdt 反推数量，回退为整仓卖出")
+
+        if sell_size_float <= 0:
+            self.log(f"[{inst_id}] ⚠️ AI 卖出数量计算结果<=0，跳过 SELL reason={sell_reason}")
             return False, None
 
         sell_sz = f"{sell_size_float:.12f}".rstrip("0").rstrip(".")
         clid = self._build_cl_ord_id("S", inst_id)
-        self.log(f"[{inst_id}] 🚀 提交 SELL 市价单 sz={sell_sz} {base_ccy} clOrdId={clid}")
+        self.log(f"[{inst_id}] 🚀 提交 SELL 市价单 sz={sell_sz} {base_ccy} reason={sell_reason} clOrdId={clid}")
         payload = self.okx.place_order(
             inst_id=inst_id,
             td_mode=self.cfg.td_mode,
@@ -1006,7 +1352,10 @@ class AutoTrader:
 
         after_snapshot = self._get_balance_snapshot(inst_id)
         self.log(f"[{inst_id}] 💰 SELL 后余额：{self._format_balance_snapshot(after_snapshot)}")
-        return True, (order_info or first)
+        out = dict(order_info or first or {})
+        out.setdefault("requestedSellBase", sell_size_float)
+        out.setdefault("sellReason", sell_reason)
+        return True, out
 
 
 def load_trade_config_from_env() -> TradeConfig:
@@ -1018,7 +1367,6 @@ def load_trade_config_from_env() -> TradeConfig:
     spot_tgt_ccy = (os.environ.get("OKX_SPOT_TGT_CCY") or "quote_ccy").strip()
     conf_threshold = int(float(os.environ.get("OKX_CONF_THRESHOLD") or 65))
     loop_seconds = int(float(os.environ.get("OKX_LOOP_SECONDS") or 60))
-    max_positions = max(0, int(float(os.environ.get("OKX_MAX_POSITIONS") or 2)))
     order_check_retries = max(1, int(float(os.environ.get("OKX_ORDER_CHECK_RETRIES") or 5)))
     order_check_interval_ms = max(0, int(float(os.environ.get("OKX_ORDER_CHECK_INTERVAL_MS") or 1000)))
 
@@ -1030,6 +1378,11 @@ def load_trade_config_from_env() -> TradeConfig:
     market_quality_threshold = max(0.0, min(1.0, float(os.environ.get("OKX_MARKET_QUALITY_THRESHOLD") or 0.58)))
     dynamic_min_factor = max(0.1, float(os.environ.get("OKX_DYNAMIC_MIN_FACTOR") or 0.7))
     dynamic_max_factor = max(dynamic_min_factor, float(os.environ.get("OKX_DYNAMIC_MAX_FACTOR") or 1.5))
+    max_total_exposure_ratio = max(0.0, min(1.0, float(os.environ.get("OKX_MAX_TOTAL_EXPOSURE_RATIO") or 0.70)))
+    max_single_asset_weight = max(0.0, min(1.0, float(os.environ.get("OKX_MAX_SINGLE_ASSET_WEIGHT") or 0.35)))
+    max_order_cash_ratio = max(0.0, min(1.0, float(os.environ.get("OKX_MAX_ORDER_CASH_RATIO") or 0.20)))
+    min_cash_reserve_ratio = max(0.0, min(1.0, float(os.environ.get("OKX_MIN_CASH_RESERVE_RATIO") or 0.10)))
+    sync_positions_on_start = (os.environ.get("OKX_SYNC_POSITIONS_ON_START") or "1").strip() not in ("0", "false", "False")
     decision_history_limit = max(10, int(float(os.environ.get("OKX_DECISION_HISTORY_LIMIT") or 300)))
 
     return TradeConfig(
@@ -1041,7 +1394,6 @@ def load_trade_config_from_env() -> TradeConfig:
         spot_tgt_ccy=spot_tgt_ccy,
         conf_threshold=conf_threshold,
         loop_seconds=loop_seconds,
-        max_positions=max_positions,
         order_check_retries=order_check_retries,
         order_check_interval_ms=order_check_interval_ms,
         stop_loss_pct=stop_loss_pct,
@@ -1052,5 +1404,10 @@ def load_trade_config_from_env() -> TradeConfig:
         market_quality_threshold=market_quality_threshold,
         dynamic_min_factor=dynamic_min_factor,
         dynamic_max_factor=dynamic_max_factor,
+        max_total_exposure_ratio=max_total_exposure_ratio,
+        max_single_asset_weight=max_single_asset_weight,
+        max_order_cash_ratio=max_order_cash_ratio,
+        min_cash_reserve_ratio=min_cash_reserve_ratio,
+        sync_positions_on_start=bool(sync_positions_on_start),
         decision_history_limit=decision_history_limit,
     )
