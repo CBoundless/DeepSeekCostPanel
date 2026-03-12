@@ -81,6 +81,7 @@ print_next_steps() {
 3. 前台试跑：${VENV_DIR}/bin/python run_autotrade.py --env-file ${ENV_TARGET}
 4. 如需 systemd：INSTALL_SYSTEMD=1 START_NOW=1 bash deploy/deploy_cvm.sh
 5. 查看服务日志：journalctl -u ${SERVICE_NAME} -f
+6. 确认日志包含版本标记：AUTOTRADE_RELEASE_TAG=risk-controls-reapply-20260312
 
 EOF
 }

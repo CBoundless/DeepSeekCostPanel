@@ -67,6 +67,8 @@ DEFAULT_MAINSTREAM_INST_IDS = [
     "BCH-USDT",
 ]
 
+AUTOTRADE_RELEASE_TAG = "risk-controls-reapply-20260312"
+
 
 LogFn = Callable[[str], None]
 
@@ -740,7 +742,7 @@ class AutoTrader:
     # ---------- internal ----------
     def _run_loop(self):
         mode_label = "模拟盘" if getattr(self.okx, "simulated_trading", False) else "实盘"
-        self.log(f"🟡 自动交易启动（OKX {mode_label}）")
+        self.log(f"🟡 自动交易启动（OKX {mode_label}） AUTOTRADE_RELEASE_TAG={AUTOTRADE_RELEASE_TAG}")
         self.log(
             f"instIds={self.cfg.inst_ids} bar={self.cfg.bar} loop={self.cfg.loop_seconds}s conf>={self.cfg.conf_threshold} "
             f"base_trade_quote={self.cfg.trade_quote} dynamic_position_enabled={self.cfg.dynamic_position_enabled} "

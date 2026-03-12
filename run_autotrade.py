@@ -20,7 +20,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from auto_trader import AutoTrader, load_trade_config_from_env
+from auto_trader import AUTOTRADE_RELEASE_TAG, AutoTrader, load_trade_config_from_env
 from deepseek_analyzer_optimized import AnalyzerConfig, OptimizedDeepSeekAnalyzer
 from okx_rest_client import OKXClient
 
@@ -253,7 +253,7 @@ def _install_signal_handlers(trader: AutoTrader, logger: logging.Logger) -> dict
 
 def _run(validate_only: bool = False) -> int:
     logger = _build_logger()
-    logger.info("无界面自动交易入口启动")
+    logger.info("无界面自动交易入口启动 AUTOTRADE_RELEASE_TAG=%s", AUTOTRADE_RELEASE_TAG)
 
     analyzer, okx = _validate_config(logger)
     if validate_only:
