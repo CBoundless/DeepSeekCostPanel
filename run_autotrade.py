@@ -175,7 +175,7 @@ def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnal
     cfg = load_trade_config_from_env()
     budget = analyzer.config.daily_budget
     logger.info(
-        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s dynamic_enabled=%s market_quality_threshold=%s dynamic_factor=[%s,%s] risk_limits(total_exposure=%s single_asset=%s order_cash=%s cash_reserve=%s) order_check_retries=%s order_check_interval_ms=%s simulated=%s",
+        "启动参数：inst_ids=%s bar=%s loop=%ss trade_quote=%s dynamic_enabled=%s market_quality_threshold=%s dynamic_factor=[%s,%s] risk_limits(total_exposure=%s single_asset=%s order_cash=%s cash_reserve=%s) cost_controls(round_trip=%s entry_buffer=%s min_net_profit=%s) order_check_retries=%s order_check_interval_ms=%s simulated=%s",
         cfg.inst_ids,
         cfg.bar,
         cfg.loop_seconds,
@@ -188,6 +188,9 @@ def _log_runtime_summary(logger: logging.Logger, analyzer: OptimizedDeepSeekAnal
         cfg.max_single_asset_weight,
         cfg.max_order_cash_ratio,
         cfg.min_cash_reserve_ratio,
+        cfg.estimated_round_trip_cost_pct,
+        cfg.entry_cost_buffer_pct,
+        cfg.min_net_profit_pct,
         cfg.order_check_retries,
         cfg.order_check_interval_ms,
         okx.simulated_trading,

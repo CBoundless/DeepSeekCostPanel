@@ -30,6 +30,9 @@ Dynamic position (持仓管理):
 - OKX_STOP_LOSS_PCT: default 0.02 (2%)
 - OKX_TRAILING_STOP_PCT: default 0.01 (1%)
 - OKX_TRAILING_ACTIVATE_PCT: default 0.005 (0.5%)
+- OKX_ESTIMATED_ROUND_TRIP_COST_PCT: default 0.0 (预估双边手续费+滑点成本，用于净收益判断)
+- OKX_ENTRY_COST_BUFFER_PCT: default 0.0 (买入前额外预留的单边成本缓冲)
+- OKX_MIN_NET_PROFIT_PCT: default 0.0 (开仓所需的最小预估净收益)
 - OKX_EXIT_ON_AI_SELL: default 1 (AI 给 SELL 且达到阈值就平仓)
 - OKX_DYNAMIC_POSITION_ENABLED: default 1 (启用非杠杆动态仓位)
 - OKX_MARKET_QUALITY_THRESHOLD: default 0.58 (低于该市场质量不新开仓)
@@ -67,7 +70,7 @@ DEFAULT_MAINSTREAM_INST_IDS = [
     "BCH-USDT",
 ]
 
-AUTOTRADE_RELEASE_TAG = "risk-controls-reapply-20260312"
+AUTOTRADE_RELEASE_TAG = "risk-cost-controls-20260313"
 
 
 LogFn = Callable[[str], None]
@@ -116,6 +119,9 @@ class TradeConfig:
     stop_loss_pct: float = 0.02
     trailing_stop_pct: float = 0.01
     trailing_activate_pct: float = 0.005
+    estimated_round_trip_cost_pct: float = 0.0
+    entry_cost_buffer_pct: float = 0.0
+    min_net_profit_pct: float = 0.0
     exit_on_ai_sell: bool = True
     dynamic_position_enabled: bool = True
     market_quality_threshold: float = 0.58
@@ -241,6 +247,24 @@ class AutoTrader:
             return None
         return (float(last) - float(entry)) / float(entry)
 
+    def _estimated_round_trip_cost_pct(self) -> float:
+        return max(0.0, float(self.cfg.estimated_round_trip_cost_pct or 0.0))
+
+    def _estimated_entry_cost_buffer_pct(self) -> float:
+        return max(0.0, float(self.cfg.entry_cost_buffer_pct or 0.0))
+
+    def _calc_net_pnl_pct(self, entry: Optional[float], last: Optional[float]) -> Optional[float]:
+        gross = self._calc_pnl_pct(entry, last)
+        if gross is None:
+            return None
+        return float(gross) - self._estimated_round_trip_cost_pct()
+
+    def _calc_target_net_profit_pct(self, entry: Optional[float], target: Optional[float]) -> Optional[float]:
+        gross = self._calc_pnl_pct(entry, target)
+        if gross is None:
+            return None
+        return float(gross) - self._estimated_round_trip_cost_pct()
+
     @staticmethod
     def _calc_drawdown_pct(peak: Optional[float], last: Optional[float]) -> Optional[float]:
         if peak is None or last is None or peak <= 0:
@@ -248,7 +272,8 @@ class AutoTrader:
         return (float(last) - float(peak)) / float(peak)
 
     def _log_position(self, inst: str, pos: PositionState, *, note: str = ""):
-        pnl = self._calc_pnl_pct(pos.entry_price, pos.last_price)
+        gross_pnl = self._calc_pnl_pct(pos.entry_price, pos.last_price)
+        net_pnl = self._calc_net_pnl_pct(pos.entry_price, pos.last_price)
         dd = self._calc_drawdown_pct(pos.peak_price, pos.last_price)
         parts = [f"[{inst}] holding={pos.holding}"]
         if pos.entry_price is not None:
@@ -261,8 +286,10 @@ class AutoTrader:
             parts.append(f"quote={pos.quote_size:.4f}")
         if pos.last_market_quality > 0:
             parts.append(f"market_q={pos.last_market_quality:.2f}")
-        if pnl is not None:
-            parts.append(f"pnl={pnl * 100:.2f}%")
+        if gross_pnl is not None:
+            parts.append(f"gross_pnl={gross_pnl * 100:.2f}%")
+        if net_pnl is not None:
+            parts.append(f"net_pnl={net_pnl * 100:.2f}%")
         if dd is not None and pos.peak_price is not None:
             parts.append(f"dd_from_peak={dd * 100:.2f}%")
         if note:
@@ -620,6 +647,41 @@ class AutoTrader:
         ai_factor = (buy_amount / float(self.cfg.trade_quote)) if float(self.cfg.trade_quote) > 0 else fallback_factor
         return buy_amount, ai_factor, "ai_buy_amount"
 
+    def _assess_buy_profitability(
+        self,
+        result: Dict[str, Any],
+        current_price: Optional[float],
+    ) -> Tuple[bool, str, Dict[str, float]]:
+        min_net_profit_pct = max(0.0, float(self.cfg.min_net_profit_pct or 0.0))
+        target_price = self._to_float((result or {}).get("target_price"))
+        meta: Dict[str, float] = {
+            "min_net_profit_pct": min_net_profit_pct,
+            "estimated_round_trip_cost_pct": self._estimated_round_trip_cost_pct(),
+            "current_price": float(current_price or 0.0),
+            "target_price": float(target_price or 0.0),
+        }
+        if min_net_profit_pct <= 0:
+            return True, "min_net_profit_disabled", meta
+        if current_price is None or current_price <= 0:
+            return False, "missing_last_price", meta
+        if target_price is None or target_price <= 0:
+            return False, "missing_target_price", meta
+
+        gross_profit_pct = self._calc_pnl_pct(current_price, target_price)
+        net_profit_pct = self._calc_target_net_profit_pct(current_price, target_price)
+        meta["gross_profit_pct"] = float(gross_profit_pct or 0.0)
+        meta["net_profit_pct"] = float(net_profit_pct or 0.0)
+
+        if gross_profit_pct is None:
+            return False, "invalid_target_price", meta
+        if float(gross_profit_pct) <= 0:
+            return False, "target_price_below_market", meta
+        if net_profit_pct is None:
+            return False, "invalid_target_net_profit", meta
+        if float(net_profit_pct) < min_net_profit_pct:
+            return False, "net_profit_below_threshold", meta
+        return True, "ok", meta
+
     def _resolve_sell_request(self, result: Dict[str, Any]) -> Tuple[Optional[float], float, bool]:
         raw_sell_ratio = (result or {}).get("sell_ratio")
         raw_sell_amount = (result or {}).get("sell_amount_usdt")
@@ -641,10 +703,21 @@ class AutoTrader:
         snapshot: Optional[Dict[str, Any]],
     ) -> Tuple[float, str, Dict[str, float]]:
         req = max(0.0, float(requested_quote))
+        entry_cost_buffer_pct = self._estimated_entry_cost_buffer_pct()
+        buffered_req = max(0.0, req * max(0.0, 1.0 - entry_cost_buffer_pct))
+        base_meta = {
+            "requested_quote": req,
+            "buffered_requested_quote": buffered_req,
+            "entry_cost_buffer_pct": entry_cost_buffer_pct,
+        }
         if req <= 0:
-            return 0.0, "non_positive_request", {"requested_quote": req}
+            return 0.0, "non_positive_request", base_meta
+        if buffered_req <= 0:
+            return 0.0, "entry_cost_buffer_exhausted", base_meta
         if not isinstance(snapshot, dict):
-            return req, "no_portfolio_snapshot", {"requested_quote": req, "final_quote": req}
+            meta = dict(base_meta)
+            meta["final_quote"] = buffered_req
+            return buffered_req, "no_portfolio_snapshot", meta
 
         available_usdt = max(0.0, float(snapshot.get("available_usdt") or 0.0))
         total_equity_usdt = max(0.0, float(snapshot.get("total_equity_usdt") or 0.0))
@@ -668,10 +741,10 @@ class AutoTrader:
                 total_equity_usdt * float(self.cfg.max_single_asset_weight) - current_inst_value,
             )
 
-        final_quote = min([req] + list(caps.values())) if caps else req
+        final_quote = min([buffered_req] + list(caps.values())) if caps else buffered_req
         final_quote = max(0.0, float(final_quote))
         meta = {
-            "requested_quote": req,
+            **base_meta,
             "final_quote": final_quote,
             "available_usdt": available_usdt,
             "total_equity_usdt": total_equity_usdt,
@@ -715,26 +788,26 @@ class AutoTrader:
     def _should_force_exit_by_risk(self, inst: str, pos: PositionState) -> bool:
         """风控触发：止损 or 移动止盈。
 
-        - 止损：pnl <= -stop_loss_pct
-        - 移动止盈：当 pnl >= trailing_activate_pct 后，如果从峰值回撤 <= -trailing_stop_pct 则平仓
+        - 止损：net_pnl <= -stop_loss_pct
+        - 移动止盈：当 net_pnl >= trailing_activate_pct 后，如果从峰值回撤 <= -trailing_stop_pct 则平仓
         """
         if not pos.holding:
             return False
 
-        pnl = self._calc_pnl_pct(pos.entry_price, pos.last_price)
-        if pnl is None:
+        net_pnl = self._calc_net_pnl_pct(pos.entry_price, pos.last_price)
+        if net_pnl is None:
             return False
 
         # hard stop loss
-        if float(pnl) <= -abs(float(self.cfg.stop_loss_pct)):
-            self._log_position(inst, pos, note=f"触发止损({self.cfg.stop_loss_pct * 100:.2f}%)")
+        if float(net_pnl) <= -abs(float(self.cfg.stop_loss_pct)):
+            self._log_position(inst, pos, note=f"触发止损(净收益 {self.cfg.stop_loss_pct * 100:.2f}%)")
             return True
 
         # trailing stop only after some profit
-        if float(pnl) >= float(self.cfg.trailing_activate_pct):
+        if float(net_pnl) >= float(self.cfg.trailing_activate_pct):
             dd = self._calc_drawdown_pct(pos.peak_price, pos.last_price)
             if dd is not None and float(dd) <= -abs(float(self.cfg.trailing_stop_pct)):
-                self._log_position(inst, pos, note=f"触发移动止盈(回撤 {self.cfg.trailing_stop_pct * 100:.2f}%)")
+                self._log_position(inst, pos, note=f"触发移动止盈(净收益达标后回撤 {self.cfg.trailing_stop_pct * 100:.2f}%)")
                 return True
 
         return False
@@ -749,9 +822,11 @@ class AutoTrader:
             f"market_quality_threshold={self.cfg.market_quality_threshold} dynamic_factor=[{self.cfg.dynamic_min_factor},{self.cfg.dynamic_max_factor}] "
             f"risk_limits(total_exposure={self.cfg.max_total_exposure_ratio}, single_asset={self.cfg.max_single_asset_weight}, "
             f"order_cash={self.cfg.max_order_cash_ratio}, cash_reserve={self.cfg.min_cash_reserve_ratio}) "
-            f"order_check_retries={self.cfg.order_check_retries} order_check_interval_ms={self.cfg.order_check_interval_ms} "
-            f"stop_loss={self.cfg.stop_loss_pct} trailing_stop={self.cfg.trailing_stop_pct} "
-            f"trailing_activate={self.cfg.trailing_activate_pct} exit_on_ai_sell={self.cfg.exit_on_ai_sell}"
+            f"cost_controls(round_trip_cost={self.cfg.estimated_round_trip_cost_pct}, entry_buffer={self.cfg.entry_cost_buffer_pct}, "
+            f"min_net_profit={self.cfg.min_net_profit_pct}) order_check_retries={self.cfg.order_check_retries} "
+            f"order_check_interval_ms={self.cfg.order_check_interval_ms} stop_loss={self.cfg.stop_loss_pct} "
+            f"trailing_stop={self.cfg.trailing_stop_pct} trailing_activate={self.cfg.trailing_activate_pct} "
+            f"exit_on_ai_sell={self.cfg.exit_on_ai_sell}"
         )
 
         # Ensure OKX auth exists
@@ -1014,6 +1089,21 @@ class AutoTrader:
                     )
                     continue
 
+                profitable, profit_reason, profit_meta = self._assess_buy_profitability(r, pos.last_price)
+                if not profitable:
+                    self._append_decision(
+                        inst_id=inst,
+                        action="SKIP",
+                        reason=profit_reason,
+                        confidence=conf,
+                        signal_quality=signal_quality,
+                        market_quality=market_quality,
+                    )
+                    self.log(
+                        f"[{inst}] BUY(conf={conf}) 但预估净收益不足 reason={profit_reason} meta={profit_meta}{_fmt_meta(r)}"
+                    )
+                    continue
+
                 requested_quote, position_factor, quote_source = self._resolve_requested_buy_quote(r, market_quality, conf)
                 if requested_quote <= 0:
                     self._append_decision(
@@ -1031,7 +1121,7 @@ class AutoTrader:
                 self._append_decision(
                     inst_id=inst,
                     action="BUY_CANDIDATE",
-                    reason=quote_source,
+                    reason=f"{quote_source},{profit_reason}",
                     confidence=conf,
                     signal_quality=signal_quality,
                     market_quality=market_quality,
@@ -1375,6 +1465,12 @@ def load_trade_config_from_env() -> TradeConfig:
     stop_loss_pct = float(os.environ.get("OKX_STOP_LOSS_PCT") or 0.02)
     trailing_stop_pct = float(os.environ.get("OKX_TRAILING_STOP_PCT") or 0.01)
     trailing_activate_pct = float(os.environ.get("OKX_TRAILING_ACTIVATE_PCT") or 0.005)
+    entry_cost_buffer_pct = max(0.0, min(1.0, float(os.environ.get("OKX_ENTRY_COST_BUFFER_PCT") or 0.0)))
+    estimated_round_trip_cost_pct = max(
+        entry_cost_buffer_pct,
+        min(1.0, float(os.environ.get("OKX_ESTIMATED_ROUND_TRIP_COST_PCT") or 0.0)),
+    )
+    min_net_profit_pct = max(0.0, min(1.0, float(os.environ.get("OKX_MIN_NET_PROFIT_PCT") or 0.0)))
     exit_on_ai_sell = (os.environ.get("OKX_EXIT_ON_AI_SELL") or "1").strip() not in ("0", "false", "False")
     dynamic_position_enabled = (os.environ.get("OKX_DYNAMIC_POSITION_ENABLED") or "1").strip() not in ("0", "false", "False")
     market_quality_threshold = max(0.0, min(1.0, float(os.environ.get("OKX_MARKET_QUALITY_THRESHOLD") or 0.58)))
@@ -1401,6 +1497,9 @@ def load_trade_config_from_env() -> TradeConfig:
         stop_loss_pct=stop_loss_pct,
         trailing_stop_pct=trailing_stop_pct,
         trailing_activate_pct=trailing_activate_pct,
+        estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+        entry_cost_buffer_pct=entry_cost_buffer_pct,
+        min_net_profit_pct=min_net_profit_pct,
         exit_on_ai_sell=bool(exit_on_ai_sell),
         dynamic_position_enabled=bool(dynamic_position_enabled),
         market_quality_threshold=market_quality_threshold,
