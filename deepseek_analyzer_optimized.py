@@ -278,6 +278,7 @@ class AnalyzerConfig:
     budget_enforcement: str = "warn"  # warn | block
     batch_parse_fallback_single: bool = True
     batch_parse_fallback_limit: int = 10
+    batch_symbols_per_request: int = 4
 
 
 class OptimizedDeepSeekAnalyzer:
@@ -334,6 +335,7 @@ class OptimizedDeepSeekAnalyzer:
         budget_enforcement: Optional[str] = None,
         batch_parse_fallback_single: Optional[bool] = None,
         batch_parse_fallback_limit: Optional[int] = None,
+        batch_symbols_per_request: Optional[int] = None,
     ) -> AnalyzerConfig:
         """应用配置（运行中动态生效）。"""
         if cache_ttl_minutes is not None:
@@ -405,6 +407,60 @@ class OptimizedDeepSeekAnalyzer:
             "remaining": max(0.0, float(remaining)) if (enabled and remaining is not None) else None,
             "exceeded": exceeded,
             "enforcement": self.config.budget_enforcement,
+        }
+
+    def _resolve_batch_symbols_per_request(self, total_items: int) -> int:
+        configured = max(1, int(getattr(self.config, "batch_symbols_per_request", 4) or 4))
+        total = max(1, int(total_items or 1))
+        return max(1, min(configured, total))
+
+    @staticmethod
+    def _chunk_items(items: List[Any], chunk_size: int) -> List[List[Any]]:
+        size = max(1, int(chunk_size or 1))
+        return [items[idx : idx + size] for idx in range(0, len(items), size)]
+
+    def _resolve_usage_cost(self, prompt: str, content: str, usage: Optional[Dict[str, Any]]) -> Tuple[int, float]:
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
+        completion_tokens = int((usage or {}).get("completion_tokens") or 0)
+        total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
+        if total_tokens <= 0:
+            total_tokens = self._estimate_tokens(prompt, content)
+
+        if (prompt_tokens or completion_tokens) and callable(getattr(self, "_calculate_cost_from_usage", None)):
+            cost = self._calculate_cost_from_usage(prompt_tokens, completion_tokens)
+        else:
+            cost = self._calculate_cost(total_tokens)
+        return int(total_tokens), float(cost)
+
+    @staticmethod
+    def _merge_chunk_results(base_results: Dict[str, Dict], chunk_results: Dict[str, Dict]) -> None:
+        for key, value in chunk_results.items():
+            base_results[key] = value
+
+    @staticmethod
+    def _build_chunk_summary(
+        *,
+        chunk_index: int,
+        chunk_ids: List[str],
+        status: str,
+        tokens: Optional[int],
+        cost: Optional[float],
+        parsed_count: int,
+        parse_miss_count: int,
+        single_fallback_used: int,
+        single_fallback_limit: int,
+    ) -> Dict[str, Any]:
+        return {
+            "chunk_index": int(chunk_index),
+            "chunk_size": len(chunk_ids),
+            "inst_ids": list(chunk_ids),
+            "status": status,
+            "tokens": int(tokens) if tokens is not None else None,
+            "cost": round(float(cost), 6) if cost is not None else None,
+            "parsed_count": int(parsed_count),
+            "parse_miss_count": int(parse_miss_count),
+            "single_fallback_used": int(single_fallback_used),
+            "single_fallback_limit": int(single_fallback_limit),
         }
 
     @staticmethod
@@ -696,20 +752,10 @@ class OptimizedDeepSeekAnalyzer:
         force_analysis: bool = False,
         portfolio_context: Optional[Dict[str, Any]] = None,
     ) -> Dict:
-        """批量市场分析（OKX）：对多个 instId 只调用一次 DeepSeek（显著省钱）。
-
-        Args:
-            inst_ids: 例如 ["BTC-USDT", "ETH-USDT"]
-            okx_client: `okx_rest_client.OKXClient` 实例（用于拉取 K 线；可无鉴权）
-            bar: OKX bar（例如 1H/15m/1D）。为了兼容 GUI，允许你传入本项目 timeframe（1h/1d），这里会自动兼容。
-            portfolio_context: 可选的账户组合摘要，用于让模型结合当前持仓/资金给出金额建议。
-        """
-        # 兼容：`bar` 既可能是 OKX bar（1H/1D），也可能是本项目 timeframe（1h/1d）。
-        # 统一归一化到内部 timeframe（例如 1H -> 1h），并据此映射出 OKX bar。
+        """批量市场分析（OKX）：对多个 instId 做分批调用，避免单次 prompt 过大导致超时。"""
         tf = self._validate_timeframe(bar)
         okx_bar = self._map_timeframe_to_okx_bar(tf)
         tf_for_cache = tf
-
         lim = int(limit)
 
         norm_ids: List[str] = []
@@ -798,130 +844,180 @@ class OptimizedDeepSeekAnalyzer:
                 "budget": self._get_budget_state(),
             }
 
-        prompt = self._build_batch_prompt(tf_for_cache, pending, portfolio_context=portfolio_context)
-        max_tokens = min(1200, int(getattr(self.config, "max_output_tokens", 200) or 200) * max(1, len(pending)))
-        content, usage = self._call_deepseek_api_ex(prompt, max_tokens=max_tokens)
+        batch_size = self._resolve_batch_symbols_per_request(len(pending))
+        pending_chunks = self._chunk_items(pending, batch_size)
+        fallback_limit_total = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
+        fallback_remaining = fallback_limit_total
+        chunk_summaries: List[Dict[str, Any]] = []
+        total_tokens = 0
+        total_cost = 0.0
+        total_parsed_count = 0
+        total_parse_miss_count = 0
+        total_fallback_used = 0
+        failed_chunks = 0
+        succeeded_chunks = 0
 
-        if not content:
-            for inst, _ohlcv, _ind, _q in pending:
-                results[inst] = {
-                    "status": "error",
-                    "message": "API 调用失败",
-                    "recommendation": "HOLD",
-                    "confidence": 0,
-                    "source": "api_error",
-                }
-            return {
-                "status": "error",
-                "source": "api_error",
-                "results": results,
-                "budget": self._get_budget_state(),
-            }
+        for chunk_index, pending_chunk in enumerate(pending_chunks, start=1):
+            chunk_ids = [x[0] for x in pending_chunk]
+            prompt = self._build_batch_prompt(tf_for_cache, pending_chunk, portfolio_context=portfolio_context)
+            max_tokens = min(1200, int(getattr(self.config, "max_output_tokens", 200) or 200) * max(1, len(pending_chunk)))
+            content, usage = self._call_deepseek_api_ex(prompt, max_tokens=max_tokens)
 
-        parsed = self._parse_batch_response(content, [x[0] for x in pending])
-
-        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
-        completion_tokens = int((usage or {}).get("completion_tokens") or 0)
-        total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
-        if total_tokens <= 0:
-            total_tokens = self._estimate_tokens(prompt, content)
-
-        if (prompt_tokens or completion_tokens) and callable(getattr(self, "_calculate_cost_from_usage", None)):
-            cost = self._calculate_cost_from_usage(prompt_tokens, completion_tokens)
-        else:
-            cost = self._calculate_cost(total_tokens)
-
-        self.cost_tracker.record_call(total_tokens, cost)
-
-        per_cost = float(cost) / max(1, len(pending))
-        per_tokens = int(total_tokens / max(1, len(pending)))
-        fallback_candidates: List[Tuple[str, List[List], Dict]] = []
-
-        for inst, ohlcv, indicators, signal_quality in pending:
-            item = parsed.get(inst)
-            if not isinstance(item, dict) or not item:
-                out = {
-                    "status": "error",
-                    "message": "API 返回未匹配到该标的（key 可能不一致）",
-                    "raw_analysis": content,
-                    "recommendation": "HOLD",
-                    "confidence": 0,
-                    "buy_amount_usdt": 0.0,
-                    "sell_ratio": 0.0,
-                    "sell_amount_usdt": 0.0,
-                    "target_price": None,
-                    "stop_loss": None,
-                    "source": "api_parse_miss",
-                }
-                fallback_candidates.append((inst, ohlcv, indicators))
-            else:
-                out = {
-                    "status": item.get("status") or "success",
-                    "raw_analysis": item.get("raw_analysis") or content,
-                    "recommendation": (item.get("recommendation") or item.get("action") or "HOLD").upper(),
-                    "confidence": self._coerce_confidence(item.get("confidence"), default=0),
-                    "buy_amount_usdt": self._coerce_nonnegative_float(item.get("buy_amount_usdt"), default=0.0),
-                    "sell_ratio": self._coerce_ratio(item.get("sell_ratio"), default=0.0),
-                    "sell_amount_usdt": self._coerce_nonnegative_float(item.get("sell_amount_usdt"), default=0.0),
-                    "target_price": item.get("target_price"),
-                    "stop_loss": item.get("stop_loss"),
-                    "source": "api",
-                }
-
-            out["cost"] = round(per_cost, 6)
-            out["tokens"] = int(per_tokens)
-            out["budget"] = self._get_budget_state()
-            out["market_source"] = "okx"
-            out["inst_id"] = inst
-            out["signal_quality"] = float(signal_quality)
-            out["indicators"] = indicators
-            out["ohlcv_points"] = len(ohlcv)
-
-            if out.get("status") == "success" and not use_contextual_decision:
-                self.cache.set(inst, tf_for_cache, indicators, dict(out))
-            results[inst] = out
-
-
-        fallback_limit = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
-        fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and fallback_limit > 0
-        fallback_used = 0
-
-        if fallback_enabled:
-            for inst, ohlcv, indicators in fallback_candidates[:fallback_limit]:
-                single = self._analyze_single_with_existing_data(
-                    inst,
-                    tf_for_cache,
-                    ohlcv,
-                    indicators,
-                    cache_result=not use_contextual_decision,
-                    portfolio_context=portfolio_context,
+            if not content:
+                failed_chunks += 1
+                for inst, _ohlcv, _ind, _q in pending_chunk:
+                    results[inst] = {
+                        "status": "error",
+                        "message": "API 调用失败",
+                        "recommendation": "HOLD",
+                        "confidence": 0,
+                        "source": "api_error",
+                        "market_source": "okx",
+                        "inst_id": inst,
+                    }
+                chunk_summaries.append(
+                    self._build_chunk_summary(
+                        chunk_index=chunk_index,
+                        chunk_ids=chunk_ids,
+                        status="api_error",
+                        tokens=None,
+                        cost=None,
+                        parsed_count=0,
+                        parse_miss_count=0,
+                        single_fallback_used=0,
+                        single_fallback_limit=fallback_remaining,
+                    )
                 )
-                single["source"] = f"{single.get('source') or 'api'}_fallback_single"
-                single["fallback_reason"] = "batch_parse_miss"
-                single["market_source"] = "okx"
-                single["inst_id"] = inst
-                results[inst] = single
-                fallback_used += 1
+                continue
 
-        if len(fallback_candidates) > fallback_used:
-            for inst, _ohlcv, _ind in fallback_candidates[fallback_used:]:
-                results[inst]["message"] = f"{results[inst].get('message') or 'API 返回未匹配到该标的'}；单币兜底已达到上限 {fallback_limit}"
-                results[inst]["fallback_reason"] = "batch_parse_miss"
+            parsed = self._parse_batch_response(content, chunk_ids)
+            chunk_tokens, chunk_cost = self._resolve_usage_cost(prompt, content, usage)
+            self.cost_tracker.record_call(chunk_tokens, chunk_cost)
+            total_tokens += int(chunk_tokens)
+            total_cost += float(chunk_cost)
+            total_parsed_count += len(parsed)
+
+            per_cost = float(chunk_cost) / max(1, len(pending_chunk))
+            per_tokens = int(chunk_tokens / max(1, len(pending_chunk)))
+            fallback_candidates: List[Tuple[str, List[List], Dict]] = []
+
+            for inst, ohlcv, indicators, signal_quality in pending_chunk:
+                item = parsed.get(inst)
+                if not isinstance(item, dict) or not item:
+                    out = {
+                        "status": "error",
+                        "message": "API 返回未匹配到该标的（key 可能不一致）",
+                        "raw_analysis": content,
+                        "recommendation": "HOLD",
+                        "confidence": 0,
+                        "buy_amount_usdt": 0.0,
+                        "sell_ratio": 0.0,
+                        "sell_amount_usdt": 0.0,
+                        "target_price": None,
+                        "stop_loss": None,
+                        "source": "api_parse_miss",
+                    }
+                    fallback_candidates.append((inst, ohlcv, indicators))
+                else:
+                    out = {
+                        "status": item.get("status") or "success",
+                        "raw_analysis": item.get("raw_analysis") or content,
+                        "recommendation": (item.get("recommendation") or item.get("action") or "HOLD").upper(),
+                        "confidence": self._coerce_confidence(item.get("confidence"), default=0),
+                        "buy_amount_usdt": self._coerce_nonnegative_float(item.get("buy_amount_usdt"), default=0.0),
+                        "sell_ratio": self._coerce_ratio(item.get("sell_ratio"), default=0.0),
+                        "sell_amount_usdt": self._coerce_nonnegative_float(item.get("sell_amount_usdt"), default=0.0),
+                        "target_price": item.get("target_price"),
+                        "stop_loss": item.get("stop_loss"),
+                        "source": "api",
+                    }
+
+                out["cost"] = round(per_cost, 6)
+                out["tokens"] = int(per_tokens)
+                out["budget"] = self._get_budget_state()
+                out["market_source"] = "okx"
+                out["inst_id"] = inst
+                out["signal_quality"] = float(signal_quality)
+                out["indicators"] = indicators
+                out["ohlcv_points"] = len(ohlcv)
+
+                if out.get("status") == "success" and not use_contextual_decision:
+                    self.cache.set(inst, tf_for_cache, indicators, dict(out))
+                results[inst] = out
+
+            total_parse_miss_count += len(fallback_candidates)
+            chunk_fallback_limit = fallback_remaining
+            chunk_fallback_used = 0
+            fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and chunk_fallback_limit > 0
+
+            if fallback_enabled:
+                for inst, ohlcv, indicators in fallback_candidates[:chunk_fallback_limit]:
+                    single = self._analyze_single_with_existing_data(
+                        inst,
+                        tf_for_cache,
+                        ohlcv,
+                        indicators,
+                        cache_result=not use_contextual_decision,
+                        portfolio_context=portfolio_context,
+                    )
+                    single["source"] = f"{single.get('source') or 'api'}_fallback_single"
+                    single["fallback_reason"] = "batch_parse_miss"
+                    single["market_source"] = "okx"
+                    single["inst_id"] = inst
+                    results[inst] = single
+                    chunk_fallback_used += 1
+
+            if len(fallback_candidates) > chunk_fallback_used:
+                for inst, _ohlcv, _ind in fallback_candidates[chunk_fallback_used:]:
+                    results[inst]["message"] = f"{results[inst].get('message') or 'API 返回未匹配到该标的'}；单币兜底已达到上限 {fallback_limit_total}"
+                    results[inst]["fallback_reason"] = "batch_parse_miss"
+
+            fallback_remaining = max(0, fallback_remaining - chunk_fallback_used)
+            total_fallback_used += chunk_fallback_used
+            succeeded_chunks += 1
+            chunk_summaries.append(
+                self._build_chunk_summary(
+                    chunk_index=chunk_index,
+                    chunk_ids=chunk_ids,
+                    status="success",
+                    tokens=chunk_tokens,
+                    cost=chunk_cost,
+                    parsed_count=len(parsed),
+                    parse_miss_count=len(fallback_candidates),
+                    single_fallback_used=chunk_fallback_used,
+                    single_fallback_limit=chunk_fallback_limit,
+                )
+            )
+
+        if failed_chunks and succeeded_chunks:
+            status = "partial_success"
+            source = "partial_api_error"
+        elif failed_chunks and not succeeded_chunks:
+            status = "error"
+            source = "api_error"
+        else:
+            status = "success"
+            source = "batch_api_chunked" if len(pending_chunks) > 1 else "batch_api"
 
         return {
-            "status": "success",
-            "source": "batch_api",
+            "status": status,
+            "source": source,
             "results": results,
             "batch": {
                 "inst_ids": [x[0] for x in pending],
                 "okx_bar": okx_bar,
-                "tokens": int(total_tokens),
-                "cost": round(float(cost), 6),
-                "parsed_count": len(parsed),
-                "parse_miss_count": len(fallback_candidates),
-                "single_fallback_used": int(fallback_used),
-                "single_fallback_limit": int(fallback_limit),
+                "batch_count": len(pending_chunks),
+                "batch_size": batch_size,
+                "batch_sizes": [len(chunk) for chunk in pending_chunks],
+                "tokens": int(total_tokens) if total_tokens > 0 else None,
+                "cost": round(float(total_cost), 6) if total_cost > 0 else None,
+                "parsed_count": int(total_parsed_count),
+                "parse_miss_count": int(total_parse_miss_count),
+                "single_fallback_used": int(total_fallback_used),
+                "single_fallback_limit": int(fallback_limit_total),
+                "failed_batch_count": int(failed_chunks),
             },
+            "batches": chunk_summaries,
             "budget": self._get_budget_state(),
         }
 
@@ -932,12 +1028,7 @@ class OptimizedDeepSeekAnalyzer:
         limit: int = 200,
         force_analysis: bool = False,
     ) -> Dict:
-        """批量市场分析：对多个交易对只调用一次 DeepSeek（显著省钱）。
-
-        返回结构：
-        - status/source: 批量调用整体状态
-        - results: {symbol -> 单个分析结果}
-        """
+        """批量市场分析：对多个交易对按批次调用 DeepSeek，降低单次请求超时概率。"""
         tf = self._validate_timeframe(timeframe)
         lim = int(limit)
 
@@ -949,13 +1040,12 @@ class OptimizedDeepSeekAnalyzer:
                 norm_symbols.append(self._validate_symbol(str(s)))
             except Exception:
                 continue
-        norm_symbols = list(dict.fromkeys(norm_symbols))  # 去重保持顺序
+        norm_symbols = list(dict.fromkeys(norm_symbols))
 
         results: Dict[str, Dict] = {}
         pending: List[Tuple[str, List[List], Dict, float]] = []
         threshold = float(getattr(self.config, "min_signal_quality", 0.5) or 0.5)
 
-        # 先逐个拉数据与做本地过滤（缓存/频率/信号阈值/预算阻断）
         for sym in norm_symbols:
             try:
                 ohlcv = self.fetch_ohlcv_binance(sym, tf, limit=lim)
@@ -1022,109 +1112,157 @@ class OptimizedDeepSeekAnalyzer:
                 "budget": self._get_budget_state(),
             }
 
-        # 构造批量 prompt（要求严格 JSON 输出，便于解析）
-        prompt = self._build_batch_prompt(tf, pending)
-        max_tokens = min(1200, int(getattr(self.config, "max_output_tokens", 200) or 200) * max(1, len(pending)))
-        content, usage = self._call_deepseek_api_ex(prompt, max_tokens=max_tokens)
+        batch_size = self._resolve_batch_symbols_per_request(len(pending))
+        pending_chunks = self._chunk_items(pending, batch_size)
+        fallback_limit_total = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
+        fallback_remaining = fallback_limit_total
+        chunk_summaries: List[Dict[str, Any]] = []
+        total_tokens = 0
+        total_cost = 0.0
+        total_parsed_count = 0
+        total_parse_miss_count = 0
+        total_fallback_used = 0
+        failed_chunks = 0
+        succeeded_chunks = 0
 
-        if not content:
-            for sym, _ohlcv, _ind, _q in pending:
-                results[sym] = {
-                    "status": "error",
-                    "message": "API 调用失败",
-                    "recommendation": "HOLD",
-                    "confidence": 0,
-                    "source": "api_error",
-                }
-            return {
-                "status": "error",
-                "source": "api_error",
-                "results": results,
-                "budget": self._get_budget_state(),
-            }
+        for chunk_index, pending_chunk in enumerate(pending_chunks, start=1):
+            chunk_ids = [x[0] for x in pending_chunk]
+            prompt = self._build_batch_prompt(tf, pending_chunk)
+            max_tokens = min(1200, int(getattr(self.config, "max_output_tokens", 200) or 200) * max(1, len(pending_chunk)))
+            content, usage = self._call_deepseek_api_ex(prompt, max_tokens=max_tokens)
 
-        parsed = self._parse_batch_response(content, [x[0] for x in pending])
+            if not content:
+                failed_chunks += 1
+                for sym, _ohlcv, _ind, _q in pending_chunk:
+                    results[sym] = {
+                        "status": "error",
+                        "message": "API 调用失败",
+                        "recommendation": "HOLD",
+                        "confidence": 0,
+                        "source": "api_error",
+                    }
+                chunk_summaries.append(
+                    self._build_chunk_summary(
+                        chunk_index=chunk_index,
+                        chunk_ids=chunk_ids,
+                        status="api_error",
+                        tokens=None,
+                        cost=None,
+                        parsed_count=0,
+                        parse_miss_count=0,
+                        single_fallback_used=0,
+                        single_fallback_limit=fallback_remaining,
+                    )
+                )
+                continue
 
-        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
-        completion_tokens = int((usage or {}).get("completion_tokens") or 0)
-        total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
-        if total_tokens <= 0:
-            total_tokens = self._estimate_tokens(prompt, content)
+            parsed = self._parse_batch_response(content, chunk_ids)
+            chunk_tokens, chunk_cost = self._resolve_usage_cost(prompt, content, usage)
+            self.cost_tracker.record_call(chunk_tokens, chunk_cost)
+            total_tokens += int(chunk_tokens)
+            total_cost += float(chunk_cost)
+            total_parsed_count += len(parsed)
 
-        if (prompt_tokens or completion_tokens) and callable(getattr(self, "_calculate_cost_from_usage", None)):
-            cost = self._calculate_cost_from_usage(prompt_tokens, completion_tokens)
+            per_cost = float(chunk_cost) / max(1, len(pending_chunk))
+            per_tokens = int(chunk_tokens / max(1, len(pending_chunk)))
+            fallback_candidates: List[Tuple[str, List[List], Dict]] = []
+
+            for sym, ohlcv, indicators, _q in pending_chunk:
+                item = parsed.get(sym)
+                if not isinstance(item, dict) or not item:
+                    out = {
+                        "status": "error",
+                        "message": "API 返回未匹配到该交易对（key 可能不一致）",
+                        "raw_analysis": content,
+                        "recommendation": "HOLD",
+                        "confidence": 0,
+                        "target_price": None,
+                        "stop_loss": None,
+                        "source": "api_parse_miss",
+                    }
+                    fallback_candidates.append((sym, ohlcv, indicators))
+                else:
+                    out = {
+                        "status": item.get("status") or "success",
+                        "raw_analysis": item.get("raw_analysis") or content,
+                        "recommendation": (item.get("recommendation") or item.get("action") or "HOLD").upper(),
+                        "confidence": self._coerce_confidence(item.get("confidence"), default=0),
+                        "target_price": item.get("target_price"),
+                        "stop_loss": item.get("stop_loss"),
+                        "source": "api",
+                    }
+
+                out["cost"] = round(per_cost, 6)
+                out["tokens"] = int(per_tokens)
+                out["budget"] = self._get_budget_state()
+
+                if out.get("status") == "success":
+                    self.cache.set(sym, tf, indicators, dict(out))
+                results[sym] = out
+
+            total_parse_miss_count += len(fallback_candidates)
+            chunk_fallback_limit = fallback_remaining
+            chunk_fallback_used = 0
+            fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and chunk_fallback_limit > 0
+
+            if fallback_enabled:
+                for sym, ohlcv, indicators in fallback_candidates[:chunk_fallback_limit]:
+                    single = self._analyze_single_with_existing_data(sym, tf, ohlcv, indicators, cache_result=True)
+                    single["source"] = f"{single.get('source') or 'api'}_fallback_single"
+                    single["fallback_reason"] = "batch_parse_miss"
+                    results[sym] = single
+                    chunk_fallback_used += 1
+
+            if len(fallback_candidates) > chunk_fallback_used:
+                for sym, _ohlcv, _ind in fallback_candidates[chunk_fallback_used:]:
+                    results[sym]["message"] = f"{results[sym].get('message') or 'API 返回未匹配到该交易对'}；单币兜底已达到上限 {fallback_limit_total}"
+                    results[sym]["fallback_reason"] = "batch_parse_miss"
+
+            fallback_remaining = max(0, fallback_remaining - chunk_fallback_used)
+            total_fallback_used += chunk_fallback_used
+            succeeded_chunks += 1
+            chunk_summaries.append(
+                self._build_chunk_summary(
+                    chunk_index=chunk_index,
+                    chunk_ids=chunk_ids,
+                    status="success",
+                    tokens=chunk_tokens,
+                    cost=chunk_cost,
+                    parsed_count=len(parsed),
+                    parse_miss_count=len(fallback_candidates),
+                    single_fallback_used=chunk_fallback_used,
+                    single_fallback_limit=chunk_fallback_limit,
+                )
+            )
+
+        if failed_chunks and succeeded_chunks:
+            status = "partial_success"
+            source = "partial_api_error"
+        elif failed_chunks and not succeeded_chunks:
+            status = "error"
+            source = "api_error"
         else:
-            cost = self._calculate_cost(total_tokens)
-
-        self.cost_tracker.record_call(total_tokens, cost)
-
-        per_cost = float(cost) / max(1, len(pending))
-        per_tokens = int(total_tokens / max(1, len(pending)))
-        fallback_candidates: List[Tuple[str, List[List], Dict]] = []
-
-        for sym, ohlcv, indicators, _q in pending:
-            item = parsed.get(sym)
-            if not isinstance(item, dict) or not item:
-                out = {
-                    "status": "error",
-                    "message": "API 返回未匹配到该交易对（key 可能不一致）",
-                    "raw_analysis": content,
-                    "recommendation": "HOLD",
-                    "confidence": 0,
-                    "target_price": None,
-                    "stop_loss": None,
-                    "source": "api_parse_miss",
-                }
-                fallback_candidates.append((sym, ohlcv, indicators))
-            else:
-                out = {
-                    "status": item.get("status") or "success",
-                    "raw_analysis": item.get("raw_analysis") or content,
-                    "recommendation": (item.get("recommendation") or item.get("action") or "HOLD").upper(),
-                    "confidence": self._coerce_confidence(item.get("confidence"), default=0),
-                    "target_price": item.get("target_price"),
-                    "stop_loss": item.get("stop_loss"),
-                    "source": "api",
-                }
-
-            out["cost"] = round(per_cost, 6)
-            out["tokens"] = int(per_tokens)
-            out["budget"] = self._get_budget_state()
-
-            if out.get("status") == "success":
-                self.cache.set(sym, tf, indicators, dict(out))
-            results[sym] = out
-
-        fallback_limit = max(0, int(getattr(self.config, "batch_parse_fallback_limit", 0) or 0))
-        fallback_enabled = bool(getattr(self.config, "batch_parse_fallback_single", True)) and fallback_limit > 0
-        fallback_used = 0
-
-        if fallback_enabled:
-            for sym, ohlcv, indicators in fallback_candidates[:fallback_limit]:
-                single = self._analyze_single_with_existing_data(sym, tf, ohlcv, indicators, cache_result=True)
-                single["source"] = f"{single.get('source') or 'api'}_fallback_single"
-                single["fallback_reason"] = "batch_parse_miss"
-                results[sym] = single
-                fallback_used += 1
-
-        if len(fallback_candidates) > fallback_used:
-            for sym, _ohlcv, _ind in fallback_candidates[fallback_used:]:
-                results[sym]["message"] = f"{results[sym].get('message') or 'API 返回未匹配到该交易对'}；单币兜底已达到上限 {fallback_limit}"
-                results[sym]["fallback_reason"] = "batch_parse_miss"
+            status = "success"
+            source = "batch_api_chunked" if len(pending_chunks) > 1 else "batch_api"
 
         return {
-            "status": "success",
-            "source": "batch_api",
+            "status": status,
+            "source": source,
             "results": results,
             "batch": {
                 "symbols": [x[0] for x in pending],
-                "tokens": int(total_tokens),
-                "cost": round(float(cost), 6),
-                "parsed_count": len(parsed),
-                "parse_miss_count": len(fallback_candidates),
-                "single_fallback_used": int(fallback_used),
-                "single_fallback_limit": int(fallback_limit),
+                "batch_count": len(pending_chunks),
+                "batch_size": batch_size,
+                "batch_sizes": [len(chunk) for chunk in pending_chunks],
+                "tokens": int(total_tokens) if total_tokens > 0 else None,
+                "cost": round(float(total_cost), 6) if total_cost > 0 else None,
+                "parsed_count": int(total_parsed_count),
+                "parse_miss_count": int(total_parse_miss_count),
+                "single_fallback_used": int(total_fallback_used),
+                "single_fallback_limit": int(fallback_limit_total),
+                "failed_batch_count": int(failed_chunks),
             },
+            "batches": chunk_summaries,
             "budget": self._get_budget_state(),
         }
 

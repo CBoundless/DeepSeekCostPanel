@@ -161,6 +161,7 @@ def _build_analyzer() -> OptimizedDeepSeekAnalyzer:
         budget_enforcement=budget_enforcement,
         batch_parse_fallback_single=_env_bool("ANALYZER_BATCH_PARSE_FALLBACK_SINGLE", True),
         batch_parse_fallback_limit=max(0, _env_int("ANALYZER_BATCH_PARSE_FALLBACK_LIMIT", 10)),
+        batch_symbols_per_request=max(1, _env_int("ANALYZER_BATCH_SYMBOLS_PER_REQUEST", 4)),
     )
 
     base_url = _env_str("DEEPSEEK_BASE_URL", default="https://api.deepseek.com/v1") or "https://api.deepseek.com/v1"

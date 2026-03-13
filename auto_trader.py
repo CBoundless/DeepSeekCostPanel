@@ -916,16 +916,20 @@ class AutoTrader:
             bsrc = (batch or {}).get("source")
             binfo = (batch or {}).get("batch") or {}
             budget = (batch or {}).get("budget") or {}
-            if bsrc in ("batch_api", "api_error"):
+            if bsrc in ("batch_api", "batch_api_chunked", "partial_api_error", "api_error"):
                 tks = binfo.get("tokens")
                 cst = binfo.get("cost")
                 rem = budget.get("remaining")
                 parsed_count = binfo.get("parsed_count")
                 parse_miss_count = binfo.get("parse_miss_count")
                 fallback_used = binfo.get("single_fallback_used")
+                batch_count = binfo.get("batch_count")
+                batch_sizes = binfo.get("batch_sizes")
+                failed_batch_count = binfo.get("failed_batch_count")
                 self.log(
-                    f"📊 本轮批量分析 source={bsrc} tokens={tks} cost=${cst} budget_remaining={rem} "
-                    f"parsed={parsed_count} parse_miss={parse_miss_count} fallback_single={fallback_used}"
+                    f"📊 本轮批量分析 source={bsrc} batches={batch_count} batch_sizes={batch_sizes} failed_batches={failed_batch_count} "
+                    f"tokens={tks} cost=${cst} budget_remaining={rem} parsed={parsed_count} "
+                    f"parse_miss={parse_miss_count} fallback_single={fallback_used}"
                 )
         except Exception:
             pass
