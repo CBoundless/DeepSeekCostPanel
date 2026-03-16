@@ -208,6 +208,7 @@ class AutoTrader:
         self._pos: Dict[str, PositionState] = {inst: PositionState(holding=False) for inst in cfg.inst_ids}
         self._debug_conf50_printed: set[str] = set()
         self._decision_history: List[DecisionRecord] = []
+        self._order_history: List[OrderRecord] = []
 
     def start(self):
         if self._thread and self._thread.is_alive():
