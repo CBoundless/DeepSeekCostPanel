@@ -164,13 +164,14 @@ async def websocket_updates(websocket: WebSocket) -> None:
     try:
         try:
             user = resolve_user_from_token(db, token)
+            user_id = user.id
         except HTTPException:
             await websocket.close(code=4401)
             return
     finally:
         db.close()
 
-    connection_id = await realtime_hub.register(user.id, websocket)
+    connection_id = await realtime_hub.register(user_id, websocket)
     try:
         await realtime_hub.pump(connection_id)
     except WebSocketDisconnect:
