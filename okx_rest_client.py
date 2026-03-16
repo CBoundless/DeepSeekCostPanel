@@ -334,6 +334,13 @@ class OKXClient:
         # GET /api/v5/market/ticker?instId=BTC-USDT
         return self._request("GET", "/api/v5/market/ticker", params={"instId": inst_id})
 
+    def get_instruments(self, inst_type: str = "SPOT", inst_id: Optional[str] = None) -> Dict[str, Any]:
+        # GET /api/v5/public/instruments?instType=SPOT&instId=BTC-USDT
+        params: Dict[str, Any] = {"instType": str(inst_type or "SPOT").upper()}
+        if inst_id:
+            params["instId"] = inst_id
+        return self._request("GET", "/api/v5/public/instruments", params=params)
+
     # ---------- private endpoints ----------
     def require_auth(self):
         if self.auth is None or not (self.auth.api_key and self.auth.api_secret and self.auth.passphrase):

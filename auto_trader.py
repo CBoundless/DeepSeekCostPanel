@@ -52,6 +52,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from okx_rest_client import OKXClient, okx_extract_first_data
@@ -228,6 +229,7 @@ class AutoTrader:
         self._debug_conf50_printed: set[str] = set()
         self._decision_history: List[DecisionRecord] = []
         self._order_history: List[OrderRecord] = []
+        self._spot_rule_cache: Dict[str, Dict[str, float]] = {}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -340,6 +342,55 @@ class AutoTrader:
     @staticmethod
     def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
         return max(lower, min(upper, float(value)))
+
+    @staticmethod
+    def _floor_to_step(value: float, step: Optional[float]) -> float:
+        numeric = max(0.0, float(value or 0.0))
+        step_value = AutoTrader._to_float(step)
+        if step_value is None or step_value <= 0:
+            return numeric
+        try:
+            base = Decimal(str(numeric))
+            quantum = Decimal(str(step_value))
+            units = (base / quantum).quantize(Decimal("1"), rounding=ROUND_DOWN)
+            return max(0.0, float(units * quantum))
+        except (InvalidOperation, ValueError, OverflowError):
+            return numeric
+
+    def _get_spot_trade_rules(self, inst_id: str) -> Dict[str, float]:
+        cache_key = str(inst_id or "").upper()
+        cached = self._spot_rule_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        payload = self.okx.get_instruments(inst_type="SPOT", inst_id=inst_id)
+        first, err = okx_extract_first_data(payload)
+        if err or not isinstance(first, dict):
+            rules: Dict[str, float] = {}
+        else:
+            rules = {}
+            min_sz = self._to_float(first.get("minSz"))
+            lot_sz = self._to_float(first.get("lotSz"))
+            if min_sz is not None and min_sz > 0:
+                rules["min_sz"] = float(min_sz)
+            if lot_sz is not None and lot_sz > 0:
+                rules["lot_sz"] = float(lot_sz)
+        self._spot_rule_cache[cache_key] = rules
+        return rules
+
+    def _normalize_spot_base_size(self, inst_id: str, size: float) -> Tuple[float, Optional[str]]:
+        normalized = max(0.0, float(size or 0.0))
+        rules = self._get_spot_trade_rules(inst_id)
+        lot_sz = self._to_float(rules.get("lot_sz"))
+        min_sz = self._to_float(rules.get("min_sz"))
+        if lot_sz is not None and lot_sz > 0:
+            normalized = self._floor_to_step(normalized, lot_sz)
+        if normalized <= 0:
+            if lot_sz is not None and lot_sz > 0:
+                return 0.0, f"按最小步进 {lot_sz:g} 对齐后数量为 0"
+            return 0.0, "数量为 0"
+        if min_sz is not None and min_sz > 0 and normalized + 1e-12 < min_sz:
+            return 0.0, f"数量 {normalized:.12f} 小于最小下单量 {min_sz:.12f}"
+        return normalized, None
 
     def _append_decision(
         self,
@@ -651,6 +702,7 @@ class AutoTrader:
                     or 0.0
                 ),
             )
+            base_size, _ = self._normalize_spot_base_size(inst_id, base_size)
             if base_size <= 0:
                 continue
 
@@ -1470,10 +1522,11 @@ class AutoTrader:
         except Exception:
             avail_base = None
 
+        pos = self._pos.get(inst_id) or PositionState()
+        self._pos[inst_id] = pos
         tracked_base = 0.0
         tracked_last_price = 0.0
         try:
-            pos = self._pos.get(inst_id) or PositionState()
             tracked_base = max(0.0, float(pos.base_size))
             tracked_last_price = max(0.0, float(pos.last_price or 0.0))
         except Exception:
@@ -1510,6 +1563,11 @@ class AutoTrader:
 
         if sell_size_float <= 0:
             self.log(f"[{inst_id}] ⚠️ AI 卖出数量计算结果<=0，跳过 SELL reason={sell_reason}")
+            return False, None
+
+        sell_size_float, normalize_reason = self._normalize_spot_base_size(inst_id, sell_size_float)
+        if sell_size_float <= 0:
+            self.log(f"[{inst_id}] ⚠️ SELL 数量不满足交易所规则，跳过 SELL reason={sell_reason} detail={normalize_reason}")
             return False, None
 
         sell_sz = f"{sell_size_float:.12f}".rstrip("0").rstrip(".")
