@@ -107,6 +107,8 @@ class TradeConfig:
     inst_ids: List[str]
     bar: str
     limit: int = 200
+    exchange: str = "okx"
+    market_type: str = "spot"
     td_mode: str = "cash"  # spot
     trade_quote: float = 15.0
     spot_tgt_ccy: str = "quote_ccy"
