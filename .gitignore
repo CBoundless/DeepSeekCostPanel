@@ -4,15 +4,25 @@ __pycache__/
 
 # Virtualenv
 .venv/
+.venv_x86/
+.venv_x86_64/
 venv/
 
 # PyInstaller
 build/
 dist/
 *.spec
+DeepSeekCostPanel-macos-*.zip
+
+# Backend runtime data
+backend/data/
 
 # Logs
 *.log
 
 # OS
 .DS_Store
+
+# Local deploy env files
+**/*.env
+!**/*.env.example

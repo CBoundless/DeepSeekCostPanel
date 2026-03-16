@@ -352,6 +352,80 @@ class AutoTrader:
         lim = max(1, int(limit))
         return list(self._decision_history[-lim:])
 
+    def get_order_history(self, limit: int = 50) -> List[OrderRecord]:
+        lim = max(1, int(limit))
+        return list(self._order_history[-lim:])
+
+    def _append_order(
+        self,
+        *,
+        inst_id: str,
+        side: str,
+        purpose: str,
+        order: Optional[Dict[str, Any]],
+        requested_quote: Optional[float] = None,
+        requested_size: Optional[float] = None,
+    ) -> None:
+        raw = dict(order or {})
+        self._order_history.append(
+            OrderRecord(
+                ts=time.time(),
+                inst_id=inst_id,
+                side=str(side or "").upper(),
+                purpose=str(purpose or "trade"),
+                ord_id=(raw.get("ordId") or raw.get("orderId") or None),
+                cl_ord_id=(raw.get("clOrdId") or raw.get("clientOrderId") or None),
+                state=str(raw.get("state") or "unknown"),
+                ord_type=str(raw.get("ordType") or raw.get("type") or "market"),
+                requested_quote=self._to_float(requested_quote),
+                requested_size=self._to_float(requested_size),
+                filled_size=self._to_float(raw.get("accFillSz") or raw.get("fillSz") or raw.get("executedQty")),
+                avg_px=self._to_float(raw.get("avgPx") or raw.get("avgPrice")),
+                fill_px=self._to_float(raw.get("fillPx") or raw.get("price")),
+                fee=self._to_float(raw.get("fee") or raw.get("commission")),
+                raw=raw,
+            )
+        )
+        if len(self._order_history) > 300:
+            self._order_history = self._order_history[-300:]
+
+    def _analysis_symbols(self) -> List[str]:
+        if str(self.cfg.exchange or "okx").lower() != "binance":
+            return list(self.cfg.inst_ids)
+        out: List[str] = []
+        for inst in self.cfg.inst_ids:
+            token = str(inst or "").strip().upper().replace("/", "-")
+            if token.endswith("-SWAP"):
+                token = token[:-5]
+            out.append(token.replace("-", ""))
+        return out
+
+    def _analysis_results(self, portfolio_snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if str(self.cfg.exchange or "okx").lower() == "binance":
+            batch = self.analyzer.analyze_markets_from_binance(
+                symbols=self._analysis_symbols(),
+                timeframe=self.cfg.bar,
+                limit=int(self.cfg.limit),
+                force_analysis=False,
+            )
+            results = (batch or {}).get("results") or {}
+            normalized: Dict[str, Any] = {}
+            for inst in self.cfg.inst_ids:
+                symbol = str(inst or "").strip().upper().replace("/", "-")
+                if symbol.endswith("-SWAP"):
+                    symbol = symbol[:-5]
+                normalized[inst] = results.get(symbol.replace("-", "")) or {}
+            batch["results"] = normalized
+            return batch
+        return self.analyzer.analyze_markets_from_okx(
+            inst_ids=self.cfg.inst_ids,
+            okx_client=self.okx,
+            bar=self.cfg.bar,
+            limit=int(self.cfg.limit),
+            force_analysis=False,
+            portfolio_context=portfolio_snapshot,
+        )
+
     def _calc_trend_strength(self, indicators: Dict[str, Any]) -> float:
         ema_9 = self._to_float(indicators.get("ema_9")) or 0.0
         ema_20 = self._to_float(indicators.get("ema_20")) or 0.0
@@ -1338,6 +1412,13 @@ class AutoTrader:
         self.log(f"[{inst_id}] 💰 BUY 后余额：{self._format_balance_snapshot(after_snapshot)}")
         out = dict(order_info or first or {})
         out.setdefault("requestQuote", effective_quote)
+        self._append_order(
+            inst_id=inst_id,
+            side="BUY",
+            purpose="open_long_spot",
+            order=out,
+            requested_quote=effective_quote,
+        )
         return True, out
 
     def _close_long_spot(
@@ -1451,6 +1532,13 @@ class AutoTrader:
         out = dict(order_info or first or {})
         out.setdefault("requestedSellBase", sell_size_float)
         out.setdefault("sellReason", sell_reason)
+        self._append_order(
+            inst_id=inst_id,
+            side="SELL",
+            purpose="close_long_spot",
+            order=out,
+            requested_size=sell_size_float,
+        )
         return True, out
 
 
