@@ -103,6 +103,25 @@ class DecisionRecord:
 
 
 @dataclass
+class OrderRecord:
+    ts: float
+    inst_id: str
+    side: str
+    purpose: str = "trade"
+    ord_id: Optional[str] = None
+    cl_ord_id: Optional[str] = None
+    state: str = "unknown"
+    ord_type: str = "market"
+    requested_quote: Optional[float] = None
+    requested_size: Optional[float] = None
+    filled_size: Optional[float] = None
+    avg_px: Optional[float] = None
+    fill_px: Optional[float] = None
+    fee: Optional[float] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class TradeConfig:
     inst_ids: List[str]
     bar: str
