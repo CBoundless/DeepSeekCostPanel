@@ -392,6 +392,23 @@ class AutoTrader:
             return 0.0, f"数量 {normalized:.12f} 小于最小下单量 {min_sz:.12f}"
         return normalized, None
 
+    def _get_spot_min_buy_quote(self, inst_id: str, last_price: Optional[float] = None) -> Tuple[Optional[float], Optional[float]]:
+        rules = self._get_spot_trade_rules(inst_id)
+        min_sz = self._to_float(rules.get("min_sz"))
+        if min_sz is None or min_sz <= 0:
+            return None, None
+
+        resolved_price = self._to_float(last_price)
+        if resolved_price is None or resolved_price <= 0:
+            pos = self._pos.get(inst_id)
+            resolved_price = self._to_float(getattr(pos, "last_price", None)) if pos is not None else None
+        if resolved_price is None or resolved_price <= 0:
+            resolved_price = self._to_float(self._get_last_price(inst_id))
+        if resolved_price is None or resolved_price <= 0:
+            return None, None
+
+        return float(min_sz) * float(resolved_price), float(resolved_price)
+
     def _append_decision(
         self,
         *,
@@ -900,6 +917,15 @@ class AutoTrader:
             "current_inst_value": current_inst_value,
         }
         meta.update({k: float(v) for k, v in caps.items()})
+
+        min_buy_quote, min_buy_price = self._get_spot_min_buy_quote(inst_id)
+        if min_buy_quote is not None and min_buy_quote > 0:
+            meta["exchange_min_buy_quote"] = float(min_buy_quote)
+            if min_buy_price is not None and min_buy_price > 0:
+                meta["exchange_min_buy_price"] = float(min_buy_price)
+            if final_quote + 1e-12 < min_buy_quote:
+                return 0.0, "below_exchange_min_buy_quote", meta
+
         reason = "ok" if final_quote > 0 else "risk_blocked"
         return final_quote, reason, meta
 
@@ -1440,6 +1466,14 @@ class AutoTrader:
                 effective_quote = capped
         except Exception:
             pass
+
+        min_buy_quote, min_buy_price = self._get_spot_min_buy_quote(inst_id)
+        if min_buy_quote is not None and min_buy_quote > 0 and effective_quote + 1e-12 < min_buy_quote:
+            price_text = f"{min_buy_price:.4f}" if min_buy_price is not None and min_buy_price > 0 else "n/a"
+            self.log(
+                f"[{inst_id}] ⚠️ BUY 金额 {effective_quote:.4f} 小于交易所最小下单额 {min_buy_quote:.4f}（按最新价 {price_text} 估算），跳过 BUY"
+            )
+            return False, None
 
         clid = self._build_cl_ord_id("B", inst_id)
         ai_quote_text = "n/a" if requested_quote is None else f"{float(requested_quote):.4f}"
