@@ -368,6 +368,16 @@ class OKXClient:
             params["clOrdId"] = cl_ord_id
         return self._request("GET", "/api/v5/trade/order", params=params)
 
+    def get_positions(self, *, inst_type: Optional[str] = None, inst_id: Optional[str] = None) -> Dict[str, Any]:
+        # GET /api/v5/account/positions?instType=SWAP&instId=BTC-USDT-SWAP
+        self.require_auth()
+        params: Dict[str, Any] = {}
+        if inst_type:
+            params["instType"] = str(inst_type).upper()
+        if inst_id:
+            params["instId"] = inst_id
+        return self._request("GET", "/api/v5/account/positions", params=params or None)
+
     def place_order(
         self,
         *,
@@ -378,6 +388,8 @@ class OKXClient:
         sz: str,
         tgt_ccy: Optional[str] = None,
         cl_ord_id: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        reduce_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
         # POST /api/v5/trade/order
         self.require_auth()
@@ -392,6 +404,10 @@ class OKXClient:
             body["tgtCcy"] = tgt_ccy
         if cl_ord_id:
             body["clOrdId"] = cl_ord_id
+        if pos_side:
+            body["posSide"] = pos_side
+        if reduce_only is not None:
+            body["reduceOnly"] = bool(reduce_only)
         return self._request("POST", "/api/v5/trade/order", data=body)
 
     def cancel_order(self, *, inst_id: str, ord_id: Optional[str] = None, cl_ord_id: Optional[str] = None) -> Dict[str, Any]:

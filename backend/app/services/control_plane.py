@@ -27,7 +27,7 @@ from .realtime import realtime_hub
 SUPPORTED_EXCHANGES: Dict[str, Dict[str, Any]] = {
     "okx": {
         "label": "OKX",
-        "runtime_supported_markets": ["spot", "margin"],
+        "runtime_supported_markets": ["spot", "margin", "swap"],
         "backtest_supported": True,
         "supports_passphrase": True,
     },
@@ -209,8 +209,6 @@ def determine_runtime_support(exchange: str, market_type: str) -> Dict[str, Any]
     supported = market_key in set(SUPPORTED_EXCHANGES.get(exchange_key, {}).get("runtime_supported_markets", []))
     if supported:
         return {"supported": True, "reason": ""}
-    if exchange_key == "okx" and market_key == "swap":
-        return {"supported": False, "reason": "当前运行时已支持 OKX 现货/杠杆，合约先通过增强回测验证后再实盘接入。"}
     if exchange_key == "binance" and market_key != "spot":
         return {"supported": False, "reason": "当前运行时已支持 Binance 现货；杠杆/合约先通过增强回测验证。"}
     return {"supported": False, "reason": "当前组合暂未接入实时运行，请改用增强回测或切换到受支持的交易模式。"}

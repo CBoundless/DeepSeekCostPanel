@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from auto_trader import AutoTrader, TradeConfig, parse_inst_ids
+from auto_trader import AutoTrader, TradeConfig, normalize_inst_ids_for_market, parse_inst_ids
 from binance_rest_client import BinanceAuth, BinanceClient
 from deepseek_analyzer_optimized import AnalyzerConfig, OptimizedDeepSeekAnalyzer
 from okx_rest_client import OKXAuth, OKXClient
@@ -386,7 +386,8 @@ class StrategyRuntimeManager:
             )
         client.require_auth()
 
-        inst_ids = parse_inst_ids(strategy.symbols or "")
+        market_type = str(policy.get("market_type") or "spot")
+        inst_ids = normalize_inst_ids_for_market(parse_inst_ids(strategy.symbols or ""), market_type)
         if not inst_ids:
             raise ValueError("策略标的不能为空")
 
@@ -395,6 +396,7 @@ class StrategyRuntimeManager:
             bar=(strategy.timeframe or "1H").strip(),
             limit=self._to_int(config_map.get("limit"), 200),
             td_mode=str(config_map.get("td_mode") or ("cash" if policy.get("market_type") == "spot" else policy.get("margin_mode") or "cross")),
+            leverage=max(1.0, float(strategy.leverage or 1.0)),
             trade_quote=self._to_float(config_map.get("trade_quote"), 20.0) or 20.0,
             spot_tgt_ccy=str(config_map.get("spot_tgt_ccy") or "quote_ccy"),
             conf_threshold=self._to_int(config_map.get("conf_threshold"), 74),
@@ -419,7 +421,7 @@ class StrategyRuntimeManager:
             sync_positions_on_start=self._to_bool(config_map.get("sync_positions_on_start"), True),
             decision_history_limit=self._to_int(config_map.get("decision_history_limit"), 300),
             exchange=exchange,
-            market_type=str(policy.get("market_type") or "spot"),
+            market_type=market_type,
         )
 
         log_fn = (lambda _message: None) if run_id <= 0 else (lambda message: self._record_log(run_id, message))

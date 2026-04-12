@@ -927,6 +927,7 @@ class OptimizedDeepSeekAnalyzer:
                         "buy_amount_usdt": self._coerce_nonnegative_float(item.get("buy_amount_usdt"), default=0.0),
                         "sell_ratio": self._coerce_ratio(item.get("sell_ratio"), default=0.0),
                         "sell_amount_usdt": self._coerce_nonnegative_float(item.get("sell_amount_usdt"), default=0.0),
+                        "reverse_to": self._coerce_reverse_to(item.get("reverse_to"), default="none"),
                         "target_price": item.get("target_price"),
                         "stop_loss": item.get("stop_loss"),
                         "source": "api",
@@ -1272,6 +1273,8 @@ class OptimizedDeepSeekAnalyzer:
             return []
 
         lines = ["portfolio:"]
+        market_type = str(portfolio_context.get("market_type") or "spot").strip().lower()
+        supports_short = bool(portfolio_context.get("supports_short"))
         total_equity = float(portfolio_context.get("total_equity_usdt") or 0.0)
         available_usdt = float(portfolio_context.get("available_usdt") or 0.0)
         invested_usdt = float(portfolio_context.get("invested_usdt") or 0.0)
@@ -1282,6 +1285,7 @@ class OptimizedDeepSeekAnalyzer:
         max_order_cash_ratio = float(portfolio_context.get("max_order_cash_ratio") or 0.0)
         min_cash_reserve_ratio = float(portfolio_context.get("min_cash_reserve_ratio") or 0.0)
 
+        lines.append(f"- market_mode: market_type={market_type}, supports_short={1 if supports_short else 0}")
         lines.append(
             "- summary: "
             f"total_equity_usdt={total_equity:.4f}, available_usdt={available_usdt:.4f}, invested_usdt={invested_usdt:.4f}, "
@@ -1299,11 +1303,13 @@ class OptimizedDeepSeekAnalyzer:
             for item in holdings[:8]:
                 if not isinstance(item, dict):
                     continue
+                side = str(item.get("side") or "long").strip().lower()
                 lines.append(
                     "  - "
-                    f"{item.get('inst_id')}: base_size={float(item.get('base_size') or 0.0):.8f}, "
-                    f"price={float(item.get('price') or 0.0):.4f}, market_value_usdt={float(item.get('market_value_usdt') or 0.0):.4f}, "
-                    f"weight={float(item.get('weight') or 0.0):.4f}"
+                    f"{item.get('inst_id')}: side={side}, base_size={float(item.get('base_size') or 0.0):.8f}, "
+                    f"price={float(item.get('price') or 0.0):.4f}, entry_price={float(item.get('entry_price') or 0.0):.4f}, "
+                    f"market_value_usdt={float(item.get('market_value_usdt') or 0.0):.4f}, notional_usdt={float(item.get('notional_usdt') or 0.0):.4f}, "
+                    f"leverage={float(item.get('leverage') or 0.0):.2f}, weight={float(item.get('weight') or 0.0):.4f}"
                 )
         else:
             lines.append("- holdings: none")
@@ -1317,35 +1323,50 @@ class OptimizedDeepSeekAnalyzer:
     ) -> str:
         example_key = str(items[0][0]) if items else "BTC-USDT"
         holdings_map = ((portfolio_context or {}).get("holdings_by_inst") or {}) if isinstance(portfolio_context, dict) else {}
+        market_type = str((portfolio_context or {}).get("market_type") or "spot").strip().lower() if isinstance(portfolio_context, dict) else "spot"
+        supports_short = bool((portfolio_context or {}).get("supports_short")) if isinstance(portfolio_context, dict) else False
         lines = [
             "你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。",
+            "recommendation 只允许 BUY、SELL、HOLD，程序会结合当前 market_type、supports_short 和持仓方向解释动作。",
             "JSON 格式如下：",
-            f'{{"{example_key}": {{"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "buy_amount_usdt": number, "sell_ratio": 0-1, "sell_amount_usdt": number, "target_price": number|null, "stop_loss": number|null, "reason": string}}}}',
+            f'{{"{example_key}": {{"recommendation": "BUY|SELL|HOLD", "confidence": 0-100, "buy_amount_usdt": number, "sell_ratio": 0-1, "sell_amount_usdt": number, "reverse_to": "none|long|short", "target_price": number|null, "stop_loss": number|null, "reason": string}}}}',
             "",
-            "强约束：confidence 必须是 0-100 的整数，不能把 50 当默认值（除非你判断确实完全中性）。",
-            "必须覆盖 data 中列出的每一个标的，不能遗漏，也不能把多个标的合并成一个 key。",
-            "输出 key 必须与 data 行首冒号前的标识完全一致（例如输入是 BTC-USDT，就输出 BTC-USDT；不要改成 BTCUSDT）。",
-            "如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0，target_price 必须为大于当前 price 的数字；如果预期上涨空间不足以覆盖手续费和滑点，请改为 HOLD。",
-            "如果 recommendation=SELL，buy_amount_usdt=0，并给出 sell_ratio（0-1 之间）或 sell_amount_usdt（>0）；两者都给也可以，target_price 可为 null。",
-            "如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0，target_price 可为 null。",
-            "请结合 portfolio 中的当前资金、持仓和风控上限来决定买多少/卖多少；程序还会做二次风控裁剪。",
+            "动作语义：",
+            "- spot：BUY=开多/加多，SELL=减多/平多，HOLD=观望；spot 不允许裸开空。",
+            "- swap 且 supports_short=1：flat 时，看涨输出 BUY、看跌输出 SELL；持有 long 时，需要减仓/平仓/反手看空输出 SELL；持有 short 时，需要平空/反手看多输出 BUY。",
+            "字段约束：",
+            "1) confidence 必须是 0-100 的整数，不能把 50 当默认值（除非你判断确实完全中性）。",
+            "2) 必须覆盖 data 中列出的每一个标的，不能遗漏，也不能把多个标的合并成一个 key。",
+            "3) 输出 key 必须与 data 行首冒号前的标识完全一致（例如输入是 BTC-USDT，就输出 BTC-USDT；不要改成 BTCUSDT）。",
+            "4) reverse_to 默认填 none；只有在你明确判断应当先平当前仓、再在同一轮反手时才填 long 或 short。spot 模式下 reverse_to 不能填 short。",
+            "5) 如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0；若当前持有 short，这至少表示平空；若同时希望同轮反手做多，请填 reverse_to=long，程序会先全平空，再用 buy_amount_usdt 作为新多仓金额。若当前为 flat/long，则表示看涨开多或加多，target_price 也应大于当前 price。若预期上涨空间不足以覆盖手续费和滑点，请改为 HOLD。",
+            "6) 如果 recommendation=SELL，buy_amount_usdt=0；若当前持有 long 且 reverse_to=none，则 sell_ratio（0-1）或 sell_amount_usdt（>0）表示减仓/平仓，target_price 可为 null；若当前持有 long 且希望同轮反手看空，请填 reverse_to=short，程序会先全平多，再用 sell_amount_usdt 作为新空仓金额。若当前为 flat/short 且 supports_short=1，则这表示开空或加空，sell_amount_usdt 必须 > 0，sell_ratio=0，target_price 应小于当前 price。若预期下跌空间不足以覆盖手续费和滑点，请改为 HOLD。",
+            "7) 如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0，reverse_to=none，target_price 可为 null。",
+            "8) 请结合 portfolio 中的当前资金、持仓方向和风控上限来决定买多少/卖多少；程序还会做二次风控裁剪。",
             "",
             f"timeframe: {timeframe}",
+            f"market_type: {market_type}",
+            f"supports_short: {1 if supports_short else 0}",
         ]
         lines.extend(self._build_portfolio_context_lines(portfolio_context))
         lines.append("data:")
         for sym, ohlcv, indicators, q in items:
             close_price = float(ohlcv[-1][4]) if ohlcv else 0.0
             holding = holdings_map.get(sym) if isinstance(holdings_map, dict) else None
-            holding_desc = "holding=none"
+            holding_side = "flat"
+            holding_desc = "holding_side=flat, holding_base=0.00000000, holding_entry=0.0000, holding_value_usdt=0.0000, holding_notional_usdt=0.0000, holding_weight=0.0000"
             if isinstance(holding, dict) and holding:
+                holding_side = str(holding.get("side") or "long").strip().lower()
                 holding_desc = (
+                    f"holding_side={holding_side}, "
                     f"holding_base={float(holding.get('base_size') or 0.0):.8f}, "
+                    f"holding_entry={float(holding.get('entry_price') or 0.0):.4f}, "
                     f"holding_value_usdt={float(holding.get('market_value_usdt') or 0.0):.4f}, "
+                    f"holding_notional_usdt={float(holding.get('notional_usdt') or 0.0):.4f}, "
                     f"holding_weight={float(holding.get('weight') or 0.0):.4f}"
                 )
             lines.append(
-                f"- {sym}: price={close_price:.4f}, ema9={indicators.get('ema_9', 0):.4f}, ema20={indicators.get('ema_20', 0):.4f}, ema50={indicators.get('ema_50', 0):.4f}, rsi14={indicators.get('rsi_14', 0):.2f}, macd={indicators.get('macd', 0):.4f}, signal_quality={q:.2f}, {holding_desc}"
+                f"- {sym}: price={close_price:.4f}, ema9={indicators.get('ema_9', 0):.4f}, ema20={indicators.get('ema_20', 0):.4f}, ema50={indicators.get('ema_50', 0):.4f}, rsi14={indicators.get('rsi_14', 0):.2f}, macd={indicators.get('macd', 0):.4f}, signal_quality={q:.2f}, current_side={holding_side}, {holding_desc}"
             )
         lines.append("\n只输出 JSON。")
         return "\n".join(lines)
@@ -1725,20 +1746,43 @@ class OptimizedDeepSeekAnalyzer:
 
         latest = ohlcv_data[-1]
         close_price = float(latest[4])
+        holdings_map = ((portfolio_context or {}).get("holdings_by_inst") or {}) if isinstance(portfolio_context, dict) else {}
+        market_type = str((portfolio_context or {}).get("market_type") or "spot").strip().lower() if isinstance(portfolio_context, dict) else "spot"
+        supports_short = bool((portfolio_context or {}).get("supports_short")) if isinstance(portfolio_context, dict) else False
+        holding = holdings_map.get(symbol) if isinstance(holdings_map, dict) else None
+        current_side = "flat"
+        holding_desc = "holding_side=flat, holding_base=0.00000000, holding_entry=0.0000, holding_value_usdt=0.0000, holding_notional_usdt=0.0000, holding_weight=0.0000"
+        if isinstance(holding, dict) and holding:
+            current_side = str(holding.get("side") or "long").strip().lower()
+            holding_desc = (
+                f"holding_side={current_side}, "
+                f"holding_base={float(holding.get('base_size') or 0.0):.8f}, "
+                f"holding_entry={float(holding.get('entry_price') or 0.0):.4f}, "
+                f"holding_value_usdt={float(holding.get('market_value_usdt') or 0.0):.4f}, "
+                f"holding_notional_usdt={float(holding.get('notional_usdt') or 0.0):.4f}, "
+                f"holding_weight={float(holding.get('weight') or 0.0):.4f}"
+            )
         lines = [
             "你是量化交易分析师。请严格只输出 JSON（不要 markdown、不要额外解释）。",
-            "JSON 格式：{\"recommendation\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"buy_amount_usdt\":number,\"sell_ratio\":0-1,\"sell_amount_usdt\":number,\"target_price\":number|null,\"stop_loss\":number|null,\"reason\":string}",
-            "如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0。",
-            "如果 recommendation=SELL，buy_amount_usdt=0，并给出 sell_ratio（0-1 之间）或 sell_amount_usdt（>0）。",
-            "如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0。",
+            "recommendation 只允许 BUY、SELL、HOLD，程序会结合当前 market_type、supports_short 和持仓方向解释动作。",
+            "JSON 格式：{\"recommendation\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"buy_amount_usdt\":number,\"sell_ratio\":0-1,\"sell_amount_usdt\":number,\"reverse_to\":\"none|long|short\",\"target_price\":number|null,\"stop_loss\":number|null,\"reason\":string}",
+            "动作语义：spot 中 BUY=开多/加多、SELL=减多/平多；swap 且 supports_short=1 时，flat 看涨输出 BUY、看跌输出 SELL，持有 long 要平多或反手看空输出 SELL，持有 short 要平空或反手看多输出 BUY。",
+            "字段约束：reverse_to 默认填 none；只有在你明确判断应当先平当前仓、再同轮反手时才填 long 或 short；spot 模式下 reverse_to 不能填 short。",
+            "如果 recommendation=BUY，buy_amount_usdt 必须 > 0，sell_ratio=0，sell_amount_usdt=0；当前持有 short 时，这至少表示平空；如果希望同轮反手做多，请填 reverse_to=long，程序会先全平空，再用 buy_amount_usdt 作为新多仓金额。target_price 应大于当前 price。",
+            "如果 recommendation=SELL，buy_amount_usdt=0；当前持有 long 且 reverse_to=none 时，sell_ratio（0-1）或 sell_amount_usdt（>0）表示减仓/平仓，target_price 可为 null；当前持有 long 且希望同轮反手做空时，请填 reverse_to=short，程序会先全平多，再用 sell_amount_usdt 作为新空仓金额。当前为 flat/short 且 supports_short=1 时，这表示开空或加空，sell_amount_usdt 必须 > 0，sell_ratio=0，target_price 应小于当前 price。",
+            "如果 recommendation=HOLD，buy_amount_usdt=0，sell_ratio=0，sell_amount_usdt=0，reverse_to=none。confidence 必须是 0-100 的整数，不能把 50 当默认值（除非你判断确实完全中性）。",
             f"symbol: {symbol}",
             f"timeframe: {timeframe}",
+            f"market_type: {market_type}",
+            f"supports_short: {1 if supports_short else 0}",
+            f"current_side: {current_side}",
             f"price: {close_price:.4f}",
             f"ema9: {float(indicators.get('ema_9', 0)):.4f}",
             f"ema20: {float(indicators.get('ema_20', 0)):.4f}",
             f"ema50: {float(indicators.get('ema_50', 0)):.4f}",
             f"rsi14: {float(indicators.get('rsi_14', 0)):.2f}",
             f"macd: {float(indicators.get('macd', 0)):.4f}",
+            holding_desc,
         ]
         lines.extend(self._build_portfolio_context_lines(portfolio_context))
         lines.append("只输出 JSON。")
@@ -1775,9 +1819,10 @@ class OptimizedDeepSeekAnalyzer:
                 {
                     "role": "system",
                     "content": (
-                        "你是量化交易分析师。" 
-                        "必须严格按用户要求输出 JSON（不要 markdown、不要额外解释）。" 
-                        "confidence 必须为 0-100 的整数，不能把 50 当作默认值；" 
+                        "你是量化交易分析师。"
+                        "必须严格按用户要求输出 JSON（不要 markdown、不要额外解释）。"
+                        "recommendation 仅允许 BUY、SELL、HOLD，且必须遵守用户提示中关于 spot/swap 与持仓方向的动作语义。"
+                        "confidence 必须为 0-100 的整数，不能把 50 当作默认值；"
                         "只有在你判断确实完全中性时才允许输出 50。"
                     ),
                 },
@@ -1869,6 +1914,15 @@ class OptimizedDeepSeekAnalyzer:
             return float(default)
         return max(0.0, min(1.0, value))
 
+    @staticmethod
+    def _coerce_reverse_to(v: Any, default: str = "none") -> str:
+        text = str(v or "").strip().lower()
+        if text in {"long", "short"}:
+            return text
+        if text in {"none", "flat", "hold", ""}:
+            return "none"
+        return str(default or "none").strip().lower() or "none"
+
     def _parse_analysis_response(self, response_text: str) -> Dict:
         """解析响应。
 
@@ -1883,6 +1937,7 @@ class OptimizedDeepSeekAnalyzer:
             "buy_amount_usdt": 0.0,
             "sell_ratio": 0.0,
             "sell_amount_usdt": 0.0,
+            "reverse_to": "none",
             "target_price": None,
             "stop_loss": None,
         }
@@ -1906,6 +1961,7 @@ class OptimizedDeepSeekAnalyzer:
                     result["buy_amount_usdt"] = self._coerce_nonnegative_float(obj.get("buy_amount_usdt"), default=0.0)
                     result["sell_ratio"] = self._coerce_ratio(obj.get("sell_ratio"), default=0.0)
                     result["sell_amount_usdt"] = self._coerce_nonnegative_float(obj.get("sell_amount_usdt"), default=0.0)
+                    result["reverse_to"] = self._coerce_reverse_to(obj.get("reverse_to"), default="none")
                     result["target_price"] = obj.get("target_price")
                     result["stop_loss"] = obj.get("stop_loss")
                     if obj.get("reason") is not None:
